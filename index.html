@@ -444,7 +444,298 @@
   body.edit-mode [contenteditable="true"]:focus { outline: 2px solid var(--teal); background: #fffef0; border-radius: 4px; }
 
   .cover {
-    background: linear-gradient(160deg, #0A3D3D 0%, #1A6B6B 40%, #0D2A2A 100%);
+   /* ========================================
+   COVER — HIGH READABILITY
+   ======================================== */
+
+.cover {
+  position: relative;
+  text-align: center;
+  color: #172033;
+  background: #f8fafc;
+  border-radius: 24px;
+  padding: 42px 32px 36px;
+  overflow: hidden;
+}
+
+/* ชั้นพื้นหลัง ไม่ให้รบกวนตัวอักษร */
+.cover::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(
+      circle at 15% 10%,
+      rgba(14, 116, 144, 0.10),
+      transparent 32%
+    ),
+    radial-gradient(
+      circle at 85% 90%,
+      rgba(37, 99, 235, 0.08),
+      transparent 32%
+    );
+  pointer-events: none;
+}
+
+.cover > * {
+  position: relative;
+  z-index: 1;
+}
+
+
+/* ========================================
+   LOGO
+   ======================================== */
+
+.cover-ornament {
+  width: 100px;
+  height: 100px;
+  margin: 0 auto 20px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: #ffffff;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 50%;
+
+  padding: 10px;
+
+  box-shadow:
+    0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+.cover-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+
+/* ========================================
+   LABEL
+   ======================================== */
+
+.cover-label {
+  display: inline-block;
+
+  color: #0f4c5c;
+  background: #e6f4f7;
+
+  padding: 6px 16px;
+  border-radius: 999px;
+
+  font-size: 0.95rem;
+  font-weight: 500;
+
+  margin-bottom: 18px;
+}
+
+
+/* ========================================
+   PROJECT TITLE (เพิ่ม Font Noto Serif Thai ให้หัวข้อเด่นชัดขึ้น)
+   ======================================== */
+
+.cover-title-th {
+  font-family: 'Noto Serif Thai', serif;
+  color: #0f172a;
+
+  font-size: clamp(1.55rem, 3.5vw, 2.35rem);
+  line-height: 1.5;
+
+  font-weight: 700;
+
+  max-width: 900px;
+  margin: 0 auto 14px;
+
+  text-shadow: none;
+}
+
+
+/* ========================================
+   SUBTITLE
+   ======================================== */
+
+.cover-subtitle {
+  color: #334155;
+
+  font-size: clamp(0.9rem, 2vw, 1.05rem);
+  line-height: 1.75;
+
+  font-weight: 400;
+
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+
+/* ========================================
+   DIVIDER
+   ======================================== */
+
+.cover-divider {
+  width: 90px;
+  height: 3px;
+
+  margin: 22px auto;
+
+  background: #0f766e;
+  border-radius: 999px;
+}
+
+
+/* ========================================
+   DATE / VENUE
+   ======================================== */
+
+.cover-info {
+  color: #1e293b;
+
+  font-size: 1rem;
+  line-height: 1.8;
+
+  font-weight: 500;
+}
+
+.cover-info p {
+  margin: 4px 0;
+}
+
+
+/* ========================================
+   MC ROSTER
+   ======================================== */
+
+.mc-roster {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+
+  gap: 20px;
+
+  margin-top: 24px;
+}
+
+
+/* MC Card */
+
+.mc-card {
+  background: #ffffff;
+
+  border: 1px solid #e2e8f0;
+
+  border-radius: 18px;
+
+  padding: 22px;
+
+  text-align: center;
+
+  box-shadow:
+    0 6px 20px rgba(15, 23, 42, 0.08);
+}
+
+
+/* MC Role */
+
+.mc-card-role {
+  color: #0f766e;
+
+  font-size: 0.9rem;
+  font-weight: 600;
+
+  margin-bottom: 8px;
+}
+
+
+/* MC Name (เพิ่ม Font Noto Serif Thai ให้ชื่อพิธีกรดูเป็นทางการยิ่งขึ้น) */
+
+.mc-card-name {
+  font-family: 'Noto Serif Thai', serif;
+  color: #0f172a;
+
+  font-size: 1.25rem;
+  line-height: 1.5;
+
+  font-weight: 700;
+
+  margin-bottom: 6px;
+}
+
+
+/* MC Details */
+
+.mc-card-nick {
+  color: #475569;
+
+  font-size: 0.9rem;
+  line-height: 1.7;
+
+  font-weight: 400;
+}
+
+
+/* ========================================
+   FORMAT NOTE
+   ======================================== */
+
+.format-note {
+  display: flex;
+  flex-wrap: wrap;
+
+  justify-content: center;
+
+  gap: 10px;
+
+  margin-top: 20px;
+}
+
+.format-pill {
+  color: #334155;
+
+  background: #f1f5f9;
+
+  border: 1px solid #e2e8f0;
+
+  padding: 8px 14px;
+
+  border-radius: 999px;
+
+  font-size: 0.88rem;
+  line-height: 1.6;
+
+  font-weight: 400;
+}
+
+/* ========================================
+   MOBILE
+   ======================================== */
+
+@media (max-width: 768px) {
+  .cover {
+    padding: 30px 18px;
+    border-radius: 18px;
+  }
+  .cover-ornament {
+    width: 82px;
+    height: 82px;
+  }
+  .mc-roster {
+    grid-template-columns: 1fr;
+  }
+
+  .mc-card {
+    padding: 18px;
+  }
+  .cover-title-th {
+    font-size: 1.45rem;
+  }
+  .cover-subtitle {
+    font-size: 0.88rem;
+  }
+  .cover-info {
+    font-size: 0.9rem;
+  }
+} background: linear-gradient(160deg, #0A3D3D 0%, #1A6B6B 40%, #0D2A2A 100%);
     color: white; min-height: 100vh; display: flex; flex-direction: column;
     align-items: center; justify-content: center; text-align: center;
     padding: 60px 40px; position: relative; overflow: hidden;
