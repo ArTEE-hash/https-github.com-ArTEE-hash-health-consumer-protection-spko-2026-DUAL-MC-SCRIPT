@@ -444,298 +444,7 @@
   body.edit-mode [contenteditable="true"]:focus { outline: 2px solid var(--teal); background: #fffef0; border-radius: 4px; }
 
   .cover {
-   /* ========================================
-   COVER — HIGH READABILITY
-   ======================================== */
-
-.cover {
-  position: relative;
-  text-align: center;
-  color: #172033;
-  background: #f8fafc;
-  border-radius: 24px;
-  padding: 42px 32px 36px;
-  overflow: hidden;
-}
-
-/* ชั้นพื้นหลัง ไม่ให้รบกวนตัวอักษร */
-.cover::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(
-      circle at 15% 10%,
-      rgba(14, 116, 144, 0.10),
-      transparent 32%
-    ),
-    radial-gradient(
-      circle at 85% 90%,
-      rgba(37, 99, 235, 0.08),
-      transparent 32%
-    );
-  pointer-events: none;
-}
-
-.cover > * {
-  position: relative;
-  z-index: 1;
-}
-
-
-/* ========================================
-   LOGO
-   ======================================== */
-
-.cover-ornament {
-  width: 100px;
-  height: 100px;
-  margin: 0 auto 20px;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  background: #ffffff;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 50%;
-
-  padding: 10px;
-
-  box-shadow:
-    0 8px 24px rgba(15, 23, 42, 0.12);
-}
-
-.cover-logo {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
-
-/* ========================================
-   LABEL
-   ======================================== */
-
-.cover-label {
-  display: inline-block;
-
-  color: #0f4c5c;
-  background: #e6f4f7;
-
-  padding: 6px 16px;
-  border-radius: 999px;
-
-  font-size: 0.95rem;
-  font-weight: 500;
-
-  margin-bottom: 18px;
-}
-
-
-/* ========================================
-   PROJECT TITLE (เพิ่ม Font Noto Serif Thai ให้หัวข้อเด่นชัดขึ้น)
-   ======================================== */
-
-.cover-title-th {
-  font-family: 'Noto Serif Thai', serif;
-  color: #0f172a;
-
-  font-size: clamp(1.55rem, 3.5vw, 2.35rem);
-  line-height: 1.5;
-
-  font-weight: 700;
-
-  max-width: 900px;
-  margin: 0 auto 14px;
-
-  text-shadow: none;
-}
-
-
-/* ========================================
-   SUBTITLE
-   ======================================== */
-
-.cover-subtitle {
-  color: #334155;
-
-  font-size: clamp(0.9rem, 2vw, 1.05rem);
-  line-height: 1.75;
-
-  font-weight: 400;
-
-  max-width: 900px;
-  margin: 0 auto;
-}
-
-
-/* ========================================
-   DIVIDER
-   ======================================== */
-
-.cover-divider {
-  width: 90px;
-  height: 3px;
-
-  margin: 22px auto;
-
-  background: #0f766e;
-  border-radius: 999px;
-}
-
-
-/* ========================================
-   DATE / VENUE
-   ======================================== */
-
-.cover-info {
-  color: #1e293b;
-
-  font-size: 1rem;
-  line-height: 1.8;
-
-  font-weight: 500;
-}
-
-.cover-info p {
-  margin: 4px 0;
-}
-
-
-/* ========================================
-   MC ROSTER
-   ======================================== */
-
-.mc-roster {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-
-  gap: 20px;
-
-  margin-top: 24px;
-}
-
-
-/* MC Card */
-
-.mc-card {
-  background: #ffffff;
-
-  border: 1px solid #e2e8f0;
-
-  border-radius: 18px;
-
-  padding: 22px;
-
-  text-align: center;
-
-  box-shadow:
-    0 6px 20px rgba(15, 23, 42, 0.08);
-}
-
-
-/* MC Role */
-
-.mc-card-role {
-  color: #0f766e;
-
-  font-size: 0.9rem;
-  font-weight: 600;
-
-  margin-bottom: 8px;
-}
-
-
-/* MC Name (เพิ่ม Font Noto Serif Thai ให้ชื่อพิธีกรดูเป็นทางการยิ่งขึ้น) */
-
-.mc-card-name {
-  font-family: 'Noto Serif Thai', serif;
-  color: #0f172a;
-
-  font-size: 1.25rem;
-  line-height: 1.5;
-
-  font-weight: 700;
-
-  margin-bottom: 6px;
-}
-
-
-/* MC Details */
-
-.mc-card-nick {
-  color: #475569;
-
-  font-size: 0.9rem;
-  line-height: 1.7;
-
-  font-weight: 400;
-}
-
-
-/* ========================================
-   FORMAT NOTE
-   ======================================== */
-
-.format-note {
-  display: flex;
-  flex-wrap: wrap;
-
-  justify-content: center;
-
-  gap: 10px;
-
-  margin-top: 20px;
-}
-
-.format-pill {
-  color: #334155;
-
-  background: #f1f5f9;
-
-  border: 1px solid #e2e8f0;
-
-  padding: 8px 14px;
-
-  border-radius: 999px;
-
-  font-size: 0.88rem;
-  line-height: 1.6;
-
-  font-weight: 400;
-}
-
-/* ========================================
-   MOBILE
-   ======================================== */
-
-@media (max-width: 768px) {
-  .cover {
-    padding: 30px 18px;
-    border-radius: 18px;
-  }
-  .cover-ornament {
-    width: 82px;
-    height: 82px;
-  }
-  .mc-roster {
-    grid-template-columns: 1fr;
-  }
-
-  .mc-card {
-    padding: 18px;
-  }
-  .cover-title-th {
-    font-size: 1.45rem;
-  }
-  .cover-subtitle {
-    font-size: 0.88rem;
-  }
-  .cover-info {
-    font-size: 0.9rem;
-  }
-} background: linear-gradient(160deg, #0A3D3D 0%, #1A6B6B 40%, #0D2A2A 100%);
+    background: linear-gradient(160deg, #0A3D3D 0%, #1A6B6B 40%, #0D2A2A 100%);
     color: white; min-height: 100vh; display: flex; flex-direction: column;
     align-items: center; justify-content: center; text-align: center;
     padding: 60px 40px; position: relative; overflow: hidden;
@@ -840,6 +549,183 @@
 
 
 
+<!-- Google Font: Kanit -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  /* ================================
+     COVER & MC ROSTER — KANIT
+     ================================ */
+
+  .cover,
+  .cover *,
+  .mc-roster,
+  .mc-roster *,
+  .format-note,
+  .format-note * {
+    font-family: 'Kanit', sans-serif;
+  }
+
+  /* Cover */
+  .cover {
+    position: relative;
+    text-align: center;
+  }
+
+  /* Logo */
+  .cover-ornament {
+    width: 110px;
+    height: 110px;
+    margin: 0 auto 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #ffffff;
+    border-radius: 50%;
+    padding: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  }
+
+  .cover-logo {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  /* Cover Label */
+  .cover-label {
+    font-size: 1rem;
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    margin-bottom: 14px;
+  }
+
+  /* Project Title */
+  .cover-title-th {
+    font-size: clamp(1.6rem, 4vw, 2.5rem);
+    line-height: 1.45;
+    font-weight: 600;
+    margin-bottom: 14px;
+  }
+
+  /* Subtitle */
+  .cover-subtitle {
+    font-size: clamp(0.9rem, 2vw, 1.1rem);
+    line-height: 1.7;
+    font-weight: 400;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  /* Divider */
+  .cover-divider {
+    width: 90px;
+    height: 3px;
+    margin: 22px auto;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.6;
+  }
+
+  /* Date & Venue */
+  .cover-info {
+    font-size: 1rem;
+    line-height: 1.8;
+    font-weight: 500;
+  }
+
+  .cover-info p {
+    margin: 4px 0;
+  }
+
+  /* ================================
+     MC ROSTER
+     ================================ */
+
+  .mc-roster {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+    margin-top: 28px;
+  }
+
+  .mc-card {
+    padding: 22px;
+    border-radius: 18px;
+  }
+
+  .mc-card-role {
+    font-size: 0.9rem;
+    font-weight: 500;
+    margin-bottom: 8px;
+  }
+
+  .mc-card-name {
+    font-size: 1.25rem;
+    line-height: 1.5;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+
+  .mc-card-nick {
+    font-size: 0.9rem;
+    line-height: 1.7;
+    font-weight: 400;
+  }
+
+  /* ================================
+     FORMAT NOTE
+     ================================ */
+
+  .format-note {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 22px;
+  }
+
+  .format-pill {
+    font-size: 0.9rem;
+    line-height: 1.6;
+    font-weight: 400;
+    padding: 8px 14px;
+    border-radius: 999px;
+  }
+
+  /* ================================
+     RESPONSIVE
+     ================================ */
+
+  @media (max-width: 768px) {
+    .cover-ornament {
+      width: 90px;
+      height: 90px;
+      margin-bottom: 18px;
+    }
+
+    .mc-roster {
+      grid-template-columns: 1fr;
+    }
+
+    .mc-card {
+      padding: 18px;
+    }
+
+    .cover-info {
+      font-size: 0.9rem;
+    }
+  }
+</style>
+
+
+<!-- ================================
+     COVER
+     ================================ -->
+
 <div class="cover">
   <div class="cover-ornament">
     <img
@@ -849,41 +735,77 @@
       crossorigin="anonymous"
     >
   </div>
-  <div class="cover-label">บทพิธีกรคู่ (Dual MC Script) · ฉบับใช้งานจริง</div>
-  <div class="cover-title-th editable">โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค<br>ด้านผลิตภัณฑ์สุขภาพ</div>
-  <div class="cover-subtitle editable">เขตสุขภาพกลุ่มจังหวัดภาคกลาง ปีงบประมาณ 2569 | สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</div>
+  <div class="cover-label">
+    บทพิธีกรคู่ (Dual MC Script)
+  </div>
+  <div class="cover-title-th editable">
+    โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค<br>
+    ด้านผลิตภัณฑ์สุขภาพ
+  </div>
+  <div class="cover-subtitle editable">
+    เขตสุขภาพกลุ่มจังหวัดภาคกลาง ปีงบประมาณ 2569 | สำนักงานสาธารณสุขจังหวัดสมุทรปราการ
+  </div>
   <div class="cover-divider"></div>
   <div class="cover-info">
-    <p class="editable"><strong>วันที่ 13 – 14 สิงหาคม 2569</strong></p>
-    <p class="editable"><strong>ห้องราชาเทวะ โรงแรมมิราเคิล สุวรรณภูมิ</strong></p>
+    <p class="editable">
+      <strong>วันที่ 13 – 14 สิงหาคม 2569</strong>
+    </p>
+    <p class="editable">
+      <strong>ห้องราชาเทวะ โรงแรมมิราเคิล สุวรรณภูมิ</strong>
+    </p>
   </div>
 </div>
-
-  <div class="mc-roster">
-    <div class="mc-card mc1">
-      <div class="mc-card-role">MC 1 · พิธีกรหลัก</div>
-      <div class="mc-card-name editable">นางจิตราวรรณ ฉันทจิตรปรีชา</div>
-      <div class="mc-card-nick editable">พี่ใหม่ · นักวิชาการสาธารณสุขชำนาญการ</div>
-	  <div class="mc-card-nick editable">กลุ่มงานส่งเสริมสุขภาพ.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</div>
+<!-- ================================
+     MC ROSTER
+     ================================ -->
+<div class="mc-roster">
+  <div class="mc-card mc1">
+    <div class="mc-card-role">
+      MC 1 · พิธีกรหลัก
     </div>
-    <div class="mc-card mc2">
-      <div class="mc-card-role">MC 2 · พิธีกรหลัก</div>
-      <div class="mc-card-name editable">นายศรัณยู โสตะวงศ์</div>
-      <div class="mc-card-nick editable">น้องQU · แพทย์แผนไทยชำนาญการ</div>
-      <div class="mc-card-nick editable">กลุ่มงานการแพทย์แผนไทยและการแพทย์ทางเลือก.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</div>
+    <div class="mc-card-name editable">
+      นางจิตราวรรณ ฉันทจิตรปรีชา
+    </div>
+    <div class="mc-card-nick editable">
+      พี่ใหม่ · นักวิชาการสาธารณสุขชำนาญการ
+    </div>
+    <div class="mc-card-nick editable">
+      กลุ่มงานส่งเสริมสุขภาพ.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ
     </div>
   </div>
-
-  <div class="format-note">
-    <div class="format-pill">ภาคประชุมวิชาการ: เป็นทางการ อบอุ่น สุภาพ</div>
-    <div class="format-pill">ภาคเลี้ยงค่ำ: เป็นกันเอง สนุกสนาน คึกคัก</div>
+  <div class="mc-card mc2">
+    <div class="mc-card-role">
+      MC 2 · พิธีกรหลัก
+    </div>
+    <div class="mc-card-name editable">
+      นายศรัณยู โสตะวงศ์
+    </div>
+    <div class="mc-card-nick editable">
+      น้องQU · แพทย์แผนไทยชำนาญการ
+    </div>
+    <div class="mc-card-nick editable">
+      กลุ่มงานการแพทย์แผนไทยและการแพทย์ทางเลือก.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ
+    </div>
   </div>
+</div>
+<!-- ================================
+     FORMAT NOTE
+     ================================ -->
+<div class="format-note">
+  <div class="format-pill">
+    ภาคประชุมวิชาการ: เป็นทางการ อบอุ่น สุภาพ
+  </div>
+
+  <div class="format-pill">
+    ภาคเลี้ยงค่ำ: เป็นกันเอง สนุกสนาน คึกคัก
+  </div>
+
 </div>
 
 <div class="content">
 
   <div class="toc">
-    <div class="toc-title">📋 สารบัญ</div>
+    <div class="toc-title">สารบัญ</div>
     <div class="toc-item"><div class="toc-num" style="background:#2A5A4A;">0</div><div class="editable">วันที่ 1 · ลงทะเบียน และพิธีเปิดการประชุม</div><div class="toc-time">08.00 – 09.15 น.</div></div>
     <div class="toc-item"><div class="toc-num" style="background:#2A1A6B;">1</div><div class="editable">วันที่ 1 · อภิปราย 1: กฎหมายเครื่องสำอางในสถานพยาบาลเสริมความงาม</div><div class="toc-time">09.15 – 12.00 น.</div></div>
     <div class="toc-item"><div class="toc-num" style="background:#6B2A0A;">2</div><div class="editable">วันที่ 1 · อภิปราย 2: สถานการณ์พืชกระท่อมหลังปลดล็อก</div><div class="toc-time">13.00 – 18.00 น.</div></div>
@@ -900,7 +822,7 @@
       <div class="segment-info">
         <div class="segment-label">วันที่ 1 · 13 สิงหาคม 2569 · ภาคประชุมวิชาการ</div>
         <div class="segment-title editable">ลงทะเบียน และพิธีเปิดการประชุม</div>
-        <div class="segment-time editable">⏰ 08.00 – 09.15 น.</div>
+        <div class="segment-time editable">08.00 – 09.15 น.</div>
       </div>
     </div>
 
@@ -940,7 +862,7 @@
       <div class="segment-info">
         <div class="segment-label">วันที่ 1 · ภาคประชุมวิชาการ</div>
         <div class="segment-title editable">อภิปราย 1: กระบวนการบังคับใช้กฎหมาย<br>ผลิตภัณฑ์เครื่องสำอางในสถานพยาบาลเสริมความงาม</div>
-        <div class="segment-time editable">⏰ 09.15 – 12.00 น.</div>
+        <div class="segment-time editable">09.15 – 12.00 น.</div>
       </div>
     </div>
 
@@ -954,7 +876,7 @@
 
     <div class="direction">⏸️ (วิทยากรขึ้นเวที เริ่มการอภิปราย)</div>
 
-    <div class="backup-box editable">🕥 <strong>Backup — แจ้งพักรับประทานอาหารว่างเช้า (10.30–10.45 น.):</strong>&nbsp;<div>"และสำหรับช่วงพักรับประทานอาหารว่างในเวลา 10.30 – 10.45 น. นะคะ <div>เพื่อให้การอภิปรายมีความต่อเนื่อง ทุกท่านสามารถรับประทานอาหารว่างที่ทางผู้จัดเตรียมไว้บริเวณด้านหลังห้องประชุมได้เลยค่ะ และสามารถนำเข้ามารับประทานภายในห้องประชุมได้ เพื่อติดตามการอภิปรายกันต่อเนื่องได้เลยนะคะ</div></div></div>
+    <div class="backup-box editable"><strong>Backup — แจ้งพักรับประทานอาหารว่างเช้า (10.30–10.45 น.):</strong>&nbsp;<div>"และสำหรับช่วงพักรับประทานอาหารว่างในเวลา 10.30 – 10.45 น. นะคะ <div>เพื่อให้การอภิปรายมีความต่อเนื่อง ทุกท่านสามารถรับประทานอาหารว่างที่ทางผู้จัดเตรียมไว้บริเวณด้านหลังห้องประชุมได้เลยค่ะ และสามารถนำเข้ามารับประทานภายในห้องประชุมได้ เพื่อติดตามการอภิปรายกันต่อเนื่องได้เลยนะคะ</div></div></div>
 
     <div class="direction">⏸️ (หลังเสวนาเสร็จสิ้น)</div>
 
@@ -974,7 +896,7 @@
       <div class="segment-info">
         <div class="segment-label">วันที่ 1 · ภาคประชุมวิชาการ</div>
         <div class="segment-title editable">อภิปราย 2: สถานการณ์พืชกระท่อม<br>หลังปลดออกจากบัญชียาเสพติด</div>
-        <div class="segment-time editable">⏰ 13.00 – 18.00 น.</div>
+        <div class="segment-time editable">13.00 – 18.00 น.</div>
       </div>
     </div>
 
@@ -984,20 +906,20 @@
 
     <div class="name-list editable">
       <ol>
-        <li><strong>นายจีระสันต์ มีรัตน์ธนวัต</strong> — หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข สำนักงานสาธารณสุขจังหวัดชลบุรี</li>
-        <li><strong>นายอภิชาติ ชัยวรรณ</strong> — นักวิเคราะห์นโยบายและแผนชำนาญการพิเศษ สำนักงาน ป.ป.ส.</li>
-        <li><strong>พันตำรวจเอก วีระพงษ์ คล้ายทอง</strong> — ผู้กำกับการ 4 กองบังคับการปราบปรามการกระทำความผิดเกี่ยวกับการคุ้มครองผู้บริโภค (บก.ปคบ.)</li>
-        <li><strong>นางสาวจริยา อัครวรัณธร</strong> — เภสัชกรชำนาญการพิเศษ กลุ่มคุ้มครองผู้บริโภคด้านสาธารณสุข ศูนย์วิทยาศาสตร์การแพทย์ที่ 6 ชลบุรี</li>
-        <li><strong>นายชาติชาย ตั้งทรงสุวรรณ์</strong> — นักวิชาการอาหารและยาชำนาญการพิเศษ สำนักอาหาร สำนักงานคณะกรรมการอาหารและยา</li>
-        <li><strong>นายวีระศักดิ์ เหล่าตระกูล</strong> — เภสัชกรเชี่ยวชาญ (ด้านเภสัชสาธารณสุข) สำนักงานสาธารณสุขจังหวัดนครปฐม</li>
+        <li><strong>นายจีระสันต์ มีรัตน์ธนวัต</strong> — เภสัชกรชำนาญการพิเศษ หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข สำนักงานสาธารณสุขจังหวัดชลบุรี</li>
+        <li><strong>นายอภิชาติ ชัยวรรณ</strong> — นักวิเคราะห์นโยบายและแผนชำนาญการพิเศษ สำนักงานคณะกรรมการป้องกันและปราบปรามยาเสพติด (ป.ป.ส.)(</li>
+        <li><strong>พันตำรวจเอก วีระพงษ์ คล้ายทอง</strong> — ผู้กำกับการ 4 กองบังคับการปราบปรามการกระทำความผิดเกี่ยวกับการคุ้มครองผู้บริโภค(บก.ปคบ.)กองบัญชาการตำรวจสอบสวนกลาง (CIB)</li>
+        <li><strong>นางสาวจริยา อัครวรัณธร</strong> — เภสัชกรชำนาญการพิเศษ กลุ่มคุ้มครองผู้บริโภคด้านสาธารณสุข ศูนย์วิทยาศาสตร์การแพทย์ที่ 6 ชลบุรี ผู้แทนศูนย์วิทยาศาสตร์การแพทย์</li>
+        <li><strong>นายชาติชาย ตั้งทรงสุวรรณ์</strong> — นักวิชาการอาหารและยาชำนาญการพิเศษ ผู้แทนจากสำนักอาหาร สำนักงานคณะกรรมการอาหารและยา (อย.) กระทรวงสาธารณสุข นอกจากนั้นบทบาทของท่านยังเป็นคณะอนุกรรมาธิการการคุ้มครองผู้บริโภคในคณะกรรมาธิการการพัฒนาการเมือง การมีส่วนร่วมของประชาชน สิทธิมนุษยชน สิทธิ เสรีภาพ และการคุ้มครองผู้บริโภค วุฒิสภา</li>
+        <li><strong>นายวีระศักดิ์ เหล่าตระกูล</strong> — เภสัชกรเชี่ยวชาญ (ด้านเภสัชสาธารณสุข) รองนายแพทย์สาธารณสุขจังหวัดนครปฐม สำนักงานสาธารณสุขจังหวัดนครปฐม(ผู้แทน สสจ.นครปฐม)</li>
       </ol>
     </div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">และสำหรับการอภิปรายในช่วงบ่ายวันนี้ เราได้รับเกียรติจาก&nbsp;</p><p class="isSelectedEnd"><strong>คุณณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> เภสัชกรชำนาญการพิเศษ&nbsp;</p><p class="isSelectedEnd">ผู้ช่วยนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ&nbsp;</p><p class="isSelectedEnd">เป็นผู้ดำเนินรายการตลอดช่วงการอภิปรายครับ</p><p class="isSelectedEnd"><strong><br></strong></p><p class="isSelectedEnd"><strong>ใหม่:</strong></p><p class="isSelectedEnd">ถ้าพร้อมแล้ว ขอเรียนเชิญวิทยากรและผู้ร่วมอภิปรายทุกท่านขึ้นสู่เวทีค่ะ</p><p>และขอเสียงปรบมือต้อนรับวิทยากรและผู้ดำเนินรายการทุกท่านด้วยค่ะ</p></div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">และสำหรับการอภิปรายในช่วงบ่ายวันนี้ เราได้รับเกียรติจาก&nbsp;</p><p class="isSelectedEnd"><strong>คุณณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> เภสัชกรชำนาญการพิเศษ&nbsp;</p><p class="isSelectedEnd">ผู้ช่วยนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ (ผู้แทน สสจ.นครปฐม)&nbsp;</p><p class="isSelectedEnd">เป็นผู้ดำเนินรายการตลอดช่วงการอภิปรายครับ</p><p class="isSelectedEnd"><strong><br></strong></p><p class="isSelectedEnd"><strong>ใหม่:</strong></p><p class="isSelectedEnd">ถ้าพร้อมแล้ว ขอเรียนเชิญวิทยากรและผู้ร่วมอภิปรายทุกท่านขึ้นสู่เวทีค่ะ</p><p>และขอเสียงปรบมือต้อนรับวิทยากรและผู้ดำเนินรายการทุกท่านด้วยค่ะ</p></div></div>
 
     <div class="direction">⏸️ (วิทยากรขึ้นเวที เริ่มการอภิปราย)</div>
 
-    <div class="backup-box editable">🕝 <strong>เวลา 14.30–14.45 น. พักอาหารว่างบ่าย:</strong>&nbsp;<div><p class="isSelectedEnd">และสำหรับช่วงพักรับประทานอาหารว่างในเวลา <strong>14.30 – 14.45 น.</strong> นะคะ</p><p class="isSelectedEnd">เนื่องจากการอภิปรายในช่วงบ่ายมีเนื้อหาที่น่าสนใจและต่อเนื่อง เพื่อไม่ให้ทุกท่านพลาดประเด็นสำคัญ สามารถนำอาหารว่างที่ทางผู้จัดเตรียมไว้ มารับประทานภายในห้องประชุมได้เลยนะคะ</p><p>รับประทานอาหารว่างไปด้วย และติดตามการอภิปรายกันต่อได้เลยค่ะ</p></div></div>
+    <div class="backup-box editable"><strong>เวลา 14.30–14.45 น. พักอาหารว่างบ่าย:</strong>&nbsp;<div><p class="isSelectedEnd">และสำหรับช่วงพักรับประทานอาหารว่างในเวลา <strong>14.30 – 14.45 น.</strong> นะคะ</p><p class="isSelectedEnd">เนื่องจากการอภิปรายในช่วงบ่ายมีเนื้อหาที่น่าสนใจและต่อเนื่อง เพื่อไม่ให้ทุกท่านพลาดประเด็นสำคัญ สามารถนำอาหารว่างที่ทางผู้จัดเตรียมไว้ มารับประทานภายในห้องประชุมได้เลยนะคะ</p><p>รับประทานอาหารว่างไปด้วย และติดตามการอภิปรายกันต่อได้เลยค่ะ</p></div></div>
 
     <div class="direction">⏸️ (การอภิปรายดำเนินต่อจนถึงเวลา 18.00 น.)</div>
 
@@ -1045,14 +967,14 @@
 
     <div class="name-list editable">
       <ol>
-        <li><strong>ภก. ดร. สุชาติ จองประเสริฐ</strong> — จากสำนักงานคณะกรรมการอาหารและยา</li>
-        <li><strong>ภญ. ดวงกมล นุตราวงศ์</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดสระบุรี</li>
-        <li><strong>ภญ. เรณู เดชมา</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดสิงห์บุรี</li>
-        <li><strong>ภญ. วรลักษณ์ อนันตกูล</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดราชบุรี</li>
-        <li><strong>ภก. ภาณุ ศรีวรรัตน์</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดจันทบุรี</li>
-        <li><strong>ภญ. ปิยะวรรณ จันทรสวัสดิ์</strong> — เภสัชกรชำนาญการพิเศษ โรงพยาบาลธัญบุรี จังหวัดปทุมธานี</li>
+        <li><strong>ภก.ดร.สุชาติ จองประเสริฐ</strong> — ผู้ทรงคุณวุฒิด้านความปลอดภัยและประสิทธิผลและอดีตผู้อำนวยการสำนักยา สำนักงานคณะกรรมการอาหารและยา (อย.)จากสำนักงานคณะกรรมการอาหารและยา</li>
+        <li><strong>ภญ.ดวงกมล นุตราวงศ์</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดสระบุรี</li>
+        <li><strong>ภญ.เรณู เดชมา</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดสิงห์บุรี</li>
+        <li><strong>ภญ.วรลักษณ์ อนันตกูล</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดราชบุรี</li>
+        <li><strong>ภก.ภาณุ ศรีวรรัตน์</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดจันทบุรี</li>
+        <li><strong>ภญ.ปิยะวรรณ จันทรสวัสดิ์</strong> — เภสัชกรชำนาญการพิเศษ โรงพยาบาลธัญบุรี จังหวัดปทุมธานี</li>
       </ol>
-      <div class="sub">หมายเหตุ: ภก. ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ นั่งเป็น VIP ตั้งแต่ต้นงาน&nbsp;</div><div class="sub">ไม่อยู่ในขบวนเปิดตัวนี้</div>
+      <div class="sub">หมายเหตุ: ภก.ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ นั่งเป็น VIP ตั้งแต่ต้นงาน&nbsp;</div><div class="sub">ไม่อยู่ในขบวนเปิดตัวนี้</div>
     </div>
 
     <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);">ขอเชิญทุกท่านปรบมือต้อนรับผู้เกษียณอายุราชการของเราอีกครั้งค่ะ/ครับ!</div></div>
