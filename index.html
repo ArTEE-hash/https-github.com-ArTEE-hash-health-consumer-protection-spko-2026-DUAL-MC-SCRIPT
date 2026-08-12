@@ -1,10 +1,409 @@
+
 <!DOCTYPE html>
-<html lang="th">
-<head>
+<html lang="th"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>บทพิธีกรคู่ โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภคฯ 13-14 สิงหาคม 2569</title>
-<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700;800&family=Noto+Serif+Thai:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700;800&amp;family=Noto+Serif+Thai:wght@400;600;700&amp;display=swap" rel="stylesheet">
 <style>
   :root {
     --gold: #C9922A; --gold-light: #F0C96A; --gold-pale: #FDF3DC;
@@ -146,13 +545,9 @@
   .appendix .small-note { font-size: 12.5px; color: var(--muted); font-style: italic; margin: 6px 0 18px; }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html" class="">
 
-<div class="edit-toolbar no-print" id="toolbar">
-  <span class="hint">✏️ กดปุ่ม "แก้ไขข้อความ" เพื่อพิมพ์แก้ไขบทพูด ชื่อ หรือเวลาได้โดยตรงในหน้านี้ แล้วกด "ดาวน์โหลดฉบับแก้ไข" เพื่อบันทึกเป็นไฟล์ใหม่</span>
-  <button id="editBtn" onclick="toggleEdit()">✏️ แก้ไขข้อความ</button>
-  <button id="exportBtn" onclick="exportHtml()">⬇️ ดาวน์โหลดฉบับแก้ไข</button>
-</div>
+
 
 <div class="cover">
   <div class="cover-ornament">🌿</div>
@@ -170,11 +565,13 @@
       <div class="mc-card-role">MC 1 · พิธีกรหลัก</div>
       <div class="mc-card-name editable">นางจิตราวรรณ ฉันทจิตรปรีชา</div>
       <div class="mc-card-nick editable">พี่ใหม่ · นักวิชาการสาธารณสุขชำนาญการ</div>
+	  <div class="mc-card-nick editable">กลุ่มงานส่งเสริมสุขภาพ.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</div>
     </div>
     <div class="mc-card mc2">
       <div class="mc-card-role">MC 2 · พิธีกรหลัก</div>
       <div class="mc-card-name editable">นายศรัณยู โสตะวงศ์</div>
-      <div class="mc-card-nick editable">พี่ยู · แพทย์แผนไทยชำนาญการ</div>
+      <div class="mc-card-nick editable">น้องQU · แพทย์แผนไทยชำนาญการ</div>
+      <div class="mc-card-nick editable">กลุ่มงานการแพทย์แผนไทยและการแพทย์ทางเลือก.สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</div>
     </div>
   </div>
 
@@ -212,25 +609,25 @@
 
     <div class="section-divider"><span>ต้อนรับผู้เข้าร่วมประชุม</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">สวัสดีครับ ขอต้อนรับทุกท่านเข้าสู่การประชุมเชิงปฏิบัติการ <strong>โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569</strong> ระหว่างวันที่ 13 – 14 สิงหาคม 2569 ณ ห้องราชาเทวะ โรงแรมมิราเคิล สุวรรณภูมิ แห่งนี้ครับ ผม <strong>นายศรัณยู โสตะวงศ์</strong> แพทย์แผนไทยชำนาญการ จากสำนักงานสาธารณสุขจังหวัดสมุทรปราการครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">สวัสดีครับ</p><p class="isSelectedEnd">ขอต้อนรับทุกท่านเข้าสู่การประชุมเชิงปฏิบัติการ <strong>โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569</strong>&nbsp;</p><p class="isSelectedEnd">ระหว่างวันที่ 13 – 14 สิงหาคม 2569 ณ ห้องราชาเทวะ โรงแรมมิราเคิล สุวรรณภูมิ แห่งนี้ครับ</p><p class="isSelectedEnd"><br></p><p>ผม <strong>นายศรัณยู โสตะวงศ์</strong> แพทย์แผนไทยชำนาญการ&nbsp;</p><p>จากกลุ่มงานการแพทย์แผนไทยและการแพทย์ทางเลือก สำนักงานสาธารณสุขจังหวัดสมุทรปราการครับ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">และดิฉัน <strong>นางจิตราวรรณ ฉันทจิตรปรีชา</strong> นักวิชาการสาธารณสุขชำนาญการ จากสำนักงานสาธารณสุขจังหวัดสมุทรปราการค่ะ เราสองคนรับหน้าที่เป็นพิธีกรดูแลทุกท่านตลอดสองวันของการประชุมในครั้งนี้ ร่วมกับทีมงานทุก ๆ ท่านจากกลุ่มงานคุ้มครองผู้บริโภคฯ ค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">และดิฉัน&nbsp;</p><p class="isSelectedEnd"><strong>นางจิตราวรรณ ฉันทจิตรปรีชา</strong> นักวิชาการสาธารณสุขชำนาญการ&nbsp;</p><p class="isSelectedEnd">จากกลุ่มงานส่งเสริมสุขภาพ สำนักงานสาธารณสุขจังหวัดสมุทรปราการค่ะ</p><p class="isSelectedEnd"><br></p><p>เราสองคนรับหน้าที่เป็นพิธีกร ดูแลและดำเนินรายการตลอดทั้งสองวันของการประชุมในครั้งนี้ ร่วมกับทีมงานทุก ๆ ท่านจากกลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข สำนักงานสาธารณสุขจังหวัดสมุทรปราการค่ะ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขณะนี้อยู่ในช่วงเวลาลงทะเบียนค่ะ ขอเชิญทุกท่านลงทะเบียนและรับเอกสารประกอบการประชุมได้ที่โต๊ะด้านหน้าห้องประชุมนะคะ แล้วพบกันในพิธีเปิดเวลา 09.00 น. ค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><div class="line" style="font-size: medium; background-color: rgb(254, 250, 243);"><div class="speech-bubble mc1-bubble editable" style="color: rgb(26, 18, 8);"><p class="isSelectedEnd">ขณะนี้อยู่ในช่วงเวลาลงทะเบียนค่ะ</p><p class="isSelectedEnd">ขอเชิญทุกท่านลงทะเบียน และรับเอกสารประกอบการประชุมได้ที่โต๊ะด้านหน้าห้องประชุมนะคะ</p><p>สำหรับพิธีเปิดการประชุม จะเริ่มในเวลา <strong>09.00 น.</strong> ค่ะ</p><p><br></p><div><p class="isSelectedEnd"><strong>ศรัณยู:</strong><br>สำหรับกำหนดการในวันนี้ ในช่วงภาคเช้า เราจะเริ่มต้นด้วยพิธีเปิดการประชุมในอีกไม่กี่นาทีนี้ครับ</p><p class="isSelectedEnd">จากนั้นจะเป็นการอภิปรายหัวข้อ <strong>กระบวนการบังคับใช้กฎหมายผลิตภัณฑ์เครื่องสำอางในสถานพยาบาลเสริมความงาม</strong> ไปจนถึงเวลาเที่ยงครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><strong>ใหม่:</strong><br>หลังจากพักรับประทานอาหารกลางวันแล้ว ในช่วงภาคบ่าย เราจะพบกับการอภิปรายในหัวข้อ <strong>สถานการณ์พืชกระท่อม หลังปลดออกจากบัญชียาเสพติด</strong> ซึ่งจะดำเนินต่อเนื่องไปจนถึงเวลา 18.00 น. ค่ะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><strong>ศรัณยู:</strong><br>และไฮไลต์ของค่ำคืนนี้ คือ <strong>งานเลี้ยงแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการ</strong> โดยจะเริ่มตั้งแต่เวลา 18.00 น. เป็นต้นไป&nbsp;</p><p class="isSelectedEnd">ณ ห้องราชาเทวะ ห้องนี้เลยครับ</p><p class="isSelectedEnd">รับรองว่าค่ำคืนนี้จะเป็นอีกหนึ่งช่วงเวลาที่อบอุ่น และเต็มไปด้วยรอยยิ้มและความประทับใจอย่างแน่นอนครับ</p><p class="isSelectedEnd"><br></p><p><strong>ใหม่:</strong><br>ส่วนวันพรุ่งนี้ วันที่ 14 สิงหาคม จะเป็นการบรรยายพิเศษที่น่าสนใจ และการประชุมกลุ่มย่อยในช่วงภาคเช้า ก่อนจะปิดโครงการในช่วงเที่ยงค่ะ</p></div></div></div></div></div>
 
     <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> เตรียมโต๊ะลงทะเบียน เอกสาร และป้ายชื่อ · ตรวจสอบระบบเสียง ไมโครโฟน โปรเจกเตอร์ · ประสานผู้บริหารและวิทยากรช่วงเช้า</div>
 
     <div class="section-divider"><span>พิธีเปิดการประชุม</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ได้เวลาอันสมควรแล้วครับ ขอเรียนเชิญทุกท่านเข้าสู่พิธีเปิดการประชุมอย่างเป็นทางการครับ ขอเรียนเชิญ <strong>นายแพทย์ประภาส ผูกดวง นายแพทย์สาธารณสุขจังหวัดสมุทรปราการ</strong> ประธานในพิธี ขึ้นประจำที่โพเดียมด้านบนเวที เพื่อรับฟังรายงานวัตถุประสงค์การจัดโครงการ และกล่าวเปิดการประชุมเชิงปฏิบัติการในวันนี้ครับ ขอเรียนเชิญครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><h1>พิธีเปิดการประชุม</h1><p class="isSelectedEnd"><b>ศรัณยู:</b></p><p class="isSelectedEnd">เรียน ท่านผู้บริหาร ผู้มีเกียรติ และผู้เข้าร่วมประชุมทุกท่านครับ</p><p class="isSelectedEnd">ขอต้อนรับทุกท่านเข้าสู่การประชุมเชิงปฏิบัติการ โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569 ครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ใหม่:</b></p><p class="isSelectedEnd">ดิฉัน นางจิตราวรรณ ฉันทจิตรปรีชา นักวิชาการสาธารณสุขชำนาญการค่ะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ศรัณยู:</b></p><p class="isSelectedEnd">และกระผม นายศรัณยู โสตะวงศ์ แพทย์แผนไทยชำนาญการ</p><p class="isSelectedEnd">จากสำนักงานสาธารณสุขจังหวัดสมุทรปราการครับ</p><p class="isSelectedEnd"><b><br></b></p><p class="isSelectedEnd"><b>ใหม่</b>:</p><p class="isSelectedEnd">เราสองคนรับหน้าที่เป็นพิธีกรดำเนินรายการตลอดทั้ง 2 วันนี้ ร่วมกับทีมงานทุก ๆ ท่าน จากกลุ่มงานคุ้มครองผู้บริโภคฯ สำนักงานสาธารณสุขสมุทรปราการค่ะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ศรัณยู:</b></p><p class="isSelectedEnd">ขณะนี้ได้เวลาอันสมควรแล้วครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">ขอเรียนเชิญ<b> นายแพทย์ประภาส ผูกดวง นายแพทย์สาธารณสุขจังหวัดสมุทรปราการ</b> ประธานในพิธี&nbsp;</p><p class="isSelectedEnd">ประจำที่โพเดียมด้านบนเวทีครับ เพื่อรับฟังรายงานวัตถุประสงค์การจัดโครงการ และกล่าวเปิดการประชุมเชิงปฏิบัติการในวันนี้ ตามลำดับครับ</p><p class="isSelectedEnd">/ขอเรียนเชิญครับ</p></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> เชิญประธานและผู้กล่าวรายงานขึ้นเวที ประจำโพเดียมด้านข้างเวที · เชิญทุกท่านปรบมือต้อนรับ</div>
+    <div class="cue-box editable"><strong>Cue เจ้าหน้าที่:</strong>&nbsp;<ul data-spread="false"><li>เตรียมโต๊ะลงทะเบียน เอกสาร และป้ายชื่อ</li><li>ตรวจสอบระบบเสียง ไมโครโฟน และโปรเจกเตอร์</li><li>ประสานผู้บริหารและวิทยากรช่วงเช้า</li><li>เชิญประธานและผู้กล่าวรายงานขึ้นเวที ประจำโพเดียมด้านข้างเวที&nbsp;</li><li>เชิญทุกท่านปรบมือต้อนรับ</li></ul></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">และในโอกาสนี้ ขอเรียนเชิญ <strong>นางสาวณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข กล่าวรายงานวัตถุประสงค์การจัดโครงการในครั้งนี้ค่ะ ขอเรียนเชิญค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">และขอเรียนเชิญ&nbsp;</p><p class="isSelectedEnd"><b>นางสาวณัฐยาภรณ์ วงศ์บุญเกื้อกูล เภสัชกรชำนาญการพิเศษ</b></p><p class="isSelectedEnd"><b>หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข</b></p><p class="isSelectedEnd">สำนักงานสาธารณสุขจังหวัดสมุทรปราการ<br>กล่าวรายงานวัตถุประสงค์การจัดโครงการค่ะ</p><p class="isSelectedEnd">/ขอเรียนเชิญค่ะ</p></div></div>
 
     <div class="direction">⏸️ (หลังกล่าวรายงานเสร็จ)</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอบคุณหัวหน้ากลุ่มงานคุ้มครองผู้บริโภคฯ สำหรับการกล่าวรายงานค่ะ ลำดับต่อไป ขอเรียนเชิญท่านประธานในพิธี <strong>นายแพทย์ประภาส ผูกดวง นายแพทย์สาธารณสุขจังหวัดสมุทรปราการ</strong> กล่าวเปิดการประชุมเชิงปฏิบัติการในวันนี้ค่ะ ขอเรียนเชิญค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd"><b>ใหม่:</b></p><p class="isSelectedEnd">ขอกราบขอบพระคุณท่านประธานเป็นอย่างสูงค่ะ</p><p class="isSelectedEnd">และถือเป็นอันว่า การประชุมเชิงปฏิบัติการ โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569 ได้เปิดขึ้นอย่างเป็นทางการแล้วนะคะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ขอเสียงปรบมือให้กับการเปิดการประชุมในครั้งนี้ด้วยค่ะ</b></p><p class="isSelectedEnd"><b><br></b></p><p class="isSelectedEnd"><b><br></b></p><p class="isSelectedEnd"><b>(ผู้เข้าร่วมประชุมปรบมือ)</b></p><p class="isSelectedEnd"><b>ศรัณยู:&nbsp;</b></p><p class="isSelectedEnd">และขอขอบพระคุณท่านประธานเป็นอย่างสูงครับ</p><p class="isSelectedEnd">ซึ่งท่านประธานจะยังอยู่กับเราบนเวทีนะครับ</p><p class="isSelectedEnd">ลำดับต่อไป ขอเรียนเชิญท่านประธาน พร้อมด้วยผู้บริหาร&nbsp;</p><p class="isSelectedEnd"><span style="background-color: rgba(26, 74, 107, 0.03);">หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข</span></p><p class="isSelectedEnd">เครือข่าย<span style="background-color: rgba(139, 26, 74, 0.03);">คุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง</span><span style="background-color: rgba(139, 26, 74, 0.03);">&nbsp;</span>&nbsp;และทีมงานที่เกี่ยวข้อง ร่วมถ่ายภาพเป็นที่ระลึกครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ใหม่:</b></p><p class="isSelectedEnd">ขอเรียนเชิญ...(ใครขึ้นบ้าง)</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>[Cue เชิญบุคคลขึ้นถ่ายภาพ]</b></p><p class="isSelectedEnd">ท่านประธานในพิธี นายแพทย์ประภาส ผูกดวง นายแพทย์สาธารณสุขจังหวัดสมุทรปราการ</p><p class="isSelectedEnd">นางสาวณัฐยาภรณ์ วงศ์บุญเกื้อกูล หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข</p><p class="isSelectedEnd">ผู้บริหารและผู้เกี่ยวข้องตามลำดับ</p><p class="isSelectedEnd">ทีมงานผู้จัดการประชุม ร่วมถ่ายภาพเป็นที่ระลึก</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ศรัณยู:</b></p><p class="isSelectedEnd">ขอเชิญทุกท่านจัดตำแหน่งเพื่อถ่ายภาพร่วมกันนะครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">📸<b> Cue ช่างภาพ:</b></p><p class="isSelectedEnd">ถ่ายภาพหมู่ จำนวน 2–3 ช็อต เพื่อให้ได้ภาพที่สมบูรณ์ครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><b>ใหม่:</b></p><p class="isSelectedEnd"><span style="background-color: rgba(26, 74, 107, 0.03);">ขอขอบพระคุณท่านประธานและผู้บริหารทุกท่านเป็นอย่างสูงค่ะบ</span><b></b></p></div></div>
 
     <div class="direction">⏸️ (ประธานกล่าวเปิดงาน — MC ยืนสงบนิ่งในจุดที่เหมาะสม)</div>
   </div><!-- /seg0 -->
@@ -248,23 +645,23 @@
       </div>
     </div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอกราบขอบพระคุณท่านประธานเป็นอย่างสูงครับ ถือว่าการประชุมเชิงปฏิบัติการในวันนี้ได้เปิดขึ้นอย่างเป็นทางการแล้วนับตั้งแต่บัดนี้ครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">ลำดับต่อไป&nbsp;</p><p class="isSelectedEnd">ขอเรียนเชิญเข้าสู่ช่วงอภิปรายทางวิชาการหัวข้อแรกของวันนี้ค่ะ</p><p class="isSelectedEnd">ในหัวข้อ <strong>“กระบวนการบังคับใช้กฎหมายผลิตภัณฑ์เครื่องสำอางในสถานพยาบาลเสริมความงาม”</strong> ซึ่งเป็นประเด็นที่เครือข่ายคุ้มครองผู้บริโภคให้ความสำคัญเป็นอย่างมากในปัจจุบันค่ะ</p></div></div>
 
     <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ลำดับต่อไป ขอเรียนเชิญเข้าสู่ช่วงอภิปรายทางวิชาการหัวข้อแรกของวันนี้ค่ะ ในหัวข้อ <strong>"กระบวนการบังคับใช้กฎหมายผลิตภัณฑ์เครื่องสำอางในสถานพยาบาลเสริมความงาม"</strong> ซึ่งเป็นประเด็นที่เครือข่ายคุ้มครองผู้บริโภคให้ความสำคัญเป็นอย่างมากในปัจจุบันค่ะ</div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอแนะนำผู้ร่วมอภิปรายทั้งสองท่านครับ ท่านแรก <strong>คุณรุ่งดารา เนียมโภคะ</strong> เภสัชกรชำนาญการพิเศษ หัวหน้ากลุ่มเฝ้าระวังและบังคับใช้กฎหมาย และท่านที่สอง <strong>คุณวรางคณา เทวราชสมบูรณ์</strong> เภสัชกรชำนาญการพิเศษ จากกลุ่มเฝ้าระวังและบังคับใช้กฎหมาย กองควบคุมเครื่องสำอางและวัตถุอันตราย สำนักงานคณะกรรมการอาหารและยา กระทรวงสาธารณสุขครับ โดยได้รับเกียรติจาก <strong>คุณเยาวนาถ ลาภานันต์</strong> เภสัชกรชำนาญการพิเศษ จากสำนักงานสาธารณสุขจังหวัดระยอง เป็นผู้ดำเนินรายการในช่วงนี้ครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">สำหรับการอภิปรายในช่วงเช้าวันนี้ เราได้รับเกียรติจากผู้ร่วมอภิปรายทั้ง 2 ท่านครับ</p><p class="isSelectedEnd">1) ท่านแรก <strong>คุณรุ่งดารา เนียมโภคะ</strong> เภสัชกรชำนาญการพิเศษ หัวหน้ากลุ่มเฝ้าระวังและบังคับใช้กฎหมาย</p><p class="isSelectedEnd">2) และท่านที่สอง <strong>คุณวรางคณา เทวราชสมบูรณ์</strong> เภสัชกรชำนาญการพิเศษ</p><p class="isSelectedEnd">จากกลุ่มเฝ้าระวังและบังคับใช้กฎหมาย กองควบคุมเครื่องสำอางและวัตถุอันตราย สำนักงานคณะกรรมการอาหารและยา กระทรวงสาธารณสุขครับ</p><p>และได้รับเกียรติจาก <strong>คุณเยาวนาถ ลาภานันต์</strong> เภสัชกรชำนาญการพิเศษ จากสำนักงานสาธารณสุขจังหวัดระยอง เป็นผู้ดำเนินรายการในช่วงเช้าวันนี้ครับ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอเรียนเชิญวิทยากรทุกท่านขึ้นสู่เวทีเสวนาค่ะ ขอเสียงปรบมือต้อนรับด้วยค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">ขอเรียนเชิญวิทยากรและผู้ดำเนินรายการทุกท่านขึ้นสู่เวทีเสวนาค่ะ</p><p class="isSelectedEnd"><b>ขอเสียงปรบมือต้อนรับด้วยค่ะ</b></p></div></div>
 
     <div class="direction">⏸️ (วิทยากรขึ้นเวที เริ่มการอภิปราย)</div>
 
-    <div class="backup-box editable">🕥 <strong>คิวแทรก 10.30–10.45 น. พักอาหารว่างเช้า:</strong> "ขออนุญาตแทรกสักครู่นะคะ เพื่อให้การอภิปรายมีความต่อเนื่อง ทุก ๆ ท่านสามารถนำอาหารว่างที่ทางผู้จัดได้เตรียมไว้ด้านหลังห้องประชุมเข้ามารับประทานในระหว่างการอภิปรายได้เลยนะคะ"</div>
-
+    <div class="backup-box editable">🕥 <strong>Backup — แจ้งพักรับประทานอาหารว่างเช้า (10.30–10.45 น.)</strong>&nbsp;<div>"และสำหรับช่วงพักรับประทานอาหารว่างในเวลา 10.30 – 10.45 น. นะคะ<div>เพื่อให้การอภิปรายมีความต่อเนื่อง ทุกท่านสามารถรับประทานอาหารว่างที่ทางผู้จัดได้จัดเตรียมไว้บริเวณด้านหลังห้องประชุมได้เลยค่ะ และสามารถนำเข้ามารับประทานภายในห้องประชุมได้ เพื่อจะได้ติดตามการอภิปรายกันต่อเนื่องได้เลยนะคะ</div></div></div>
+    
     <div class="direction">⏸️ (หลังเสวนาเสร็จสิ้น)</div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอขอบพระคุณวิทยากรทั้งสองท่าน และคุณเยาวนาถ ผู้ดำเนินรายการ เป็นอย่างสูงครับ สำหรับการอภิปรายที่เป็นประโยชน์อย่างยิ่งต่อการปฏิบัติงานคุ้มครองผู้บริโภคในพื้นที่ครับ ขอเสียงปรบมือให้กับวิทยากรทุกท่านอีกครั้งครับ 👏</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd"><strong>ศรัณยู:</strong><br>ขอขอบพระคุณวิทยากรทั้งสองท่าน <strong>ภญ.รุ่งดารา เนียมโภคะ</strong> และ <strong>ภญ.วรางคณา เทวราชสมบูรณ์</strong> จากกลุ่มเฝ้าระวังและบังคับใช้กฎหมาย กองควบคุมเครื่องสำอางและวัตถุอันตราย สำนักงานคณะกรรมการอาหารและยา</p><p class="isSelectedEnd">และขอขอบพระคุณ <strong>ภญ.เยาวนาถ ลาภานันต์</strong> ผู้ดำเนินรายการในช่วงเช้าวันนี้ เป็นอย่างสูงครับ</p><p class="isSelectedEnd">สำหรับการอภิปรายในหัวข้อ <strong>“กระบวนการบังคับใช้กฎหมายผลิตภัณฑ์เครื่องสำอางในสถานพยาบาลเสริมความงาม”</strong> ซึ่งเป็นหัวข้อที่ให้ทั้งความรู้และมุมมองที่เป็นประโยชน์อย่างมากต่อการปฏิบัติงานคุ้มครองผู้บริโภคในพื้นที่ครับ</p><p class="isSelectedEnd">ขอเสียงปรบมือให้กับวิทยากรและผู้ดำเนินรายการทุกท่านอีกครั้งครับ</p><p class="isSelectedEnd"><strong>(ปรบมือ)</strong></p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">และขณะนี้ก็ได้เวลาพักรับประทานอาหารกลางวันแล้วค่ะ ขอเชิญทุกท่านรับประทานอาหารกลางวันร่วมกัน และขอเชิญกลับเข้าห้องประชุมภายในเวลา 13.00 น. เพื่อร่วมรับฟังการอภิปรายหัวข้อต่อไปค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">และขณะนี้ก็ได้เวลาพักรับประทานอาหารกลางวันแล้วค่ะ</p><p class="isSelectedEnd">ขอเชิญทุกท่านรับประทานอาหารกลางวันร่วมกันที่ชั้น ..........&nbsp;</p><p class="isSelectedEnd"><strong>(แนะนำเส้นทางไปห้องอาหาร)</strong></p><p class="isSelectedEnd"><strong><br></strong></p><p class="isSelectedEnd">และขอเชิญทุกท่านกลับเข้าห้องประชุมแห่งนี้อีกครั้งในเวลา <strong>13.00 น.</strong>&nbsp;</p><p class="isSelectedEnd">เพื่อร่วมรับฟังการอภิปรายในหัวข้อที่น่าสนใจต่อไปค่ะ</p><p class="isSelectedEnd"><br></p><p>ขอให้ทุกท่านรับประทานอาหารกลางวันให้อร่อยนะคะ แล้วพบกันอีกครั้งในเวลา 13.00 น. ค่ะ</p></div></div>
 
     <div class="section-divider"><span>12.00 – 13.00 น. · รับประทานอาหารกลางวัน</span></div>
   </div><!-- /seg1 -->
@@ -282,9 +679,9 @@
       </div>
     </div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">สวัสดีอีกครั้งครับ หวังว่าทุกท่านจะได้พักผ่อนรับประทานอาหารกลางวันกันอย่างเต็มอิ่มนะครับ ลำดับต่อไปเป็นการอภิปรายหัวข้อที่สองของวันนี้ ในหัวข้อ <strong>"สถานการณ์พืชกระท่อมหลังปลดออกจากบัญชียาเสพติด"</strong> ซึ่งเป็นประเด็นที่ได้รับความสนใจจากหลายภาคส่วนครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">หลังจากที่ทุกท่านได้รับประทานอาหารกลางวันกันอย่างเต็มอิ่มแล้วนะครับ ก็ได้เวลาที่เราจะกลับเข้าสู่การประชุมในช่วงบ่ายกันต่อครับ</p><p class="isSelectedEnd"><br></p><p>สำหรับช่วงบ่ายวันนี้ เราจะเข้าสู่การอภิปรายหัวข้อที่ 2 ในหัวข้อ <strong>“สถานการณ์พืชกระท่อมหลังปลดออกจากบัญชียาเสพติด”</strong> ซึ่งเป็นอีกหนึ่งประเด็นที่ได้รับความสนใจจากหลายภาคส่วน และเกี่ยวข้องกับการปฏิบัติงานของเครือข่ายคุ้มครองผู้บริโภคในหลายด้านครับ</p><p><br></p><p>ต้องบอกว่าเป็นอีกหนึ่งช่วงที่น่าสนใจมากนะครับ เพราะเราได้ผู้ร่วมอภิปรายจากหลายหน่วยงาน หลายมุมมองมาร่วมพูดคุยกัน</p><p><br></p><p>เชื่อว่าช่วงบ่ายวันนี้ ทุกท่านจะได้รับทั้งข้อมูลและมุมมองที่หลากหลาย และสามารถนำไปใช้ประโยชน์ในการทำงานของเราได้อย่างแน่นอนครับ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">หัวข้อนี้ได้รับเกียรติจากผู้ทรงคุณวุฒิหลายภาคส่วนมาร่วมให้มุมมองที่หลากหลายค่ะ ใหม่ขอเรียนเชิญท่านวิทยากรทีละท่านตามลำดับ ดังนี้ค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">สำหรับการอภิปรายในหัวข้อนี้ เราได้รับเกียรติจากวิทยากรและผู้ร่วมอภิปรายจากหลากหลายหน่วยงาน ซึ่งจะมาร่วมแลกเปลี่ยนข้อมูลและมุมมองในประเด็นพืชกระท่อมให้พวกเราได้รับฟังกันอย่างรอบด้านค่ะ<br></p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">ดิฉันขอแนะนำวิทยากรและผู้ร่วมอภิปรายทีละท่านตามลำดับนะคะ</p><p class="isSelectedEnd"><b>ท่านที่ 1 </b><strong>ภก.จีระสันต์ มีรัตน์ธนวัต----</strong>เภสัชกรชำนาญการพิเศษ&nbsp;</p><p class="isSelectedEnd">หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข</p><p class="isSelectedEnd">สำนักงานสาธารณสุขจังหวัดชลบุรี</p><p class="isSelectedEnd"><b>ท่านที่ 2 </b><strong>นายอภิชาติ ชัยวรรณ&nbsp;</strong>นักวิเคราะห์นโยบายและแผนชำนาญการพิเศษ</p><p class="isSelectedEnd">สำนักงานคณะกรรมการป้องกันและปราบปรามยาเสพติด ค่ะ</p><p class="isSelectedEnd"><b>ท่านที่ 3 </b><strong>พันตำรวจเอก วีระพงษ์ คล้ายทอง---</strong>ผู้กำกับการ 4 กองบังคับการปราบปรามการกระทำความผิดเกี่ยวกับการคุ้มครองผู้บริโภค (บก.ปคบ.)</p><p class="isSelectedEnd"><b>ท่านที่ 4ภญ.</b><strong>จริยา อัครวรัณธร --</strong>เภสัชกรชำนาญการพิเศษ&nbsp;</p><p class="isSelectedEnd">กลุ่มคุ้มครองผู้บริโภคด้านสาธารณสุข ศูนย์วิทยาศาสตร์การแพทย์ที่ 6 ชลบุรี</p><p class="isSelectedEnd"><b>ท่านที่ 5 </b><strong>นายชาติชาย ตั้งทรงสุวรรณ์&nbsp;</strong>นักวิชาการอาหารและยาชำนาญการพิเศษ สำนักอาหาร สำนักงานคณะกรรมการอาหารและยา</p><p><b>และท่านที่ 6 </b><strong>ภก.วีระศักดิ์ เหล่าตระกูล---</strong>เภสัชกรเชี่ยวชาญ (ด้านเภสัชสาธารณสุข) รองนายแพทย์สาธาณสุขจังหวัดนครปฐม สำนักงานสาธารณสุขจังหวัดนครปฐมค่ะ</p></div></div>
 
     <div class="name-list editable">
       <ol>
@@ -297,19 +694,19 @@
       </ol>
     </div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">โดยได้รับเกียรติจาก <strong>คุณณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> เภสัชกรชำนาญการพิเศษ ผู้ช่วยนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ เป็นผู้ดำเนินรายการตลอดช่วงการอภิปรายในวันนี้ครับ ขอเรียนเชิญวิทยากรทุกท่านขึ้นเวทีครับ ขอเสียงปรบมือต้อนรับด้วยครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">และสำหรับการอภิปรายในช่วงบ่ายวันนี้ เราได้รับเกียรติจาก&nbsp;</p><p class="isSelectedEnd"><strong>คุณณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> เภสัชกรชำนาญการพิเศษ&nbsp;</p><p class="isSelectedEnd">ผู้ช่วยนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ&nbsp;</p><p class="isSelectedEnd">เป็นผู้ดำเนินรายการตลอดช่วงการอภิปรายครับ</p><p class="isSelectedEnd"><strong><br></strong></p><p class="isSelectedEnd"><strong>ใหม่:</strong></p><p class="isSelectedEnd">ถ้าพร้อมแล้ว ขอเรียนเชิญวิทยากรและผู้ร่วมอภิปรายทุกท่านขึ้นสู่เวทีค่ะ</p><p>และขอเสียงปรบมือต้อนรับวิทยากรและผู้ดำเนินรายการทุกท่านด้วยค่ะ</p></div></div>
 
     <div class="direction">⏸️ (วิทยากรขึ้นเวที เริ่มการอภิปราย)</div>
 
-    <div class="backup-box editable">🕝 <strong>คิวแทรก 14.30–14.45 น. พักอาหารว่างบ่าย:</strong> "ขออนุญาตแทรกสักครู่ค่ะ ถึงเวลาพักรับประทานอาหารว่างช่วงบ่ายแล้ว เพื่อให้การอภิปรายที่เข้มข้นนี้มีความต่อเนื่อง ขอเชิญทุกท่านนำอาหารว่างมารับประทานเพื่อรับฟังการอภิปรายต่อได้เลยนะคะ"</div>
+    <div class="backup-box editable">🕝 <strong>เวลา 14.30–14.45 น. พักอาหารว่างบ่าย:</strong>&nbsp;<div><p class="isSelectedEnd">และสำหรับช่วงพักรับประทานอาหารว่างในเวลา <strong>14.30 – 14.45 น.</strong> นะคะ</p><p class="isSelectedEnd">เนื่องจากการอภิปรายในช่วงบ่ายมีเนื้อหาที่น่าสนใจและต่อเนื่อง เพื่อไม่ให้ทุกท่านพลาดประเด็นสำคัญ สามารถนำอาหารว่างที่ทางผู้จัดเตรียมไว้ มารับประทานภายในห้องประชุมได้เลยนะคะ</p><p>รับประทานอาหารว่างไปด้วย และติดตามการอภิปรายกันต่อได้เลยค่ะ</p></div></div>
 
     <div class="direction">⏸️ (การอภิปรายดำเนินต่อจนถึงเวลา 18.00 น.)</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอขอบพระคุณวิทยากรทุกท่าน และคุณณัฐยาภรณ์ ผู้ดำเนินรายการ เป็นอย่างสูงค่ะ สำหรับข้อมูลและมุมมองที่รอบด้านในประเด็นพืชกระท่อม ซึ่งจะเป็นประโยชน์อย่างมากต่อการทำงานคุ้มครองผู้บริโภคในพื้นที่ต่อไปค่ะ ขอเสียงปรบมืออีกครั้งค่ะ 👏</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">ขอขอบพระคุณวิทยากรและผู้ร่วมอภิปรายทุกท่าน รวมถึง <strong>คุณณัฐยาภรณ์ วงศ์บุญเกื้อกูล</strong> ผู้ดำเนินรายการ เป็นอย่างสูงค่ะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">ขอบพระคุณสำหรับข้อมูล ความรู้ และมุมมองที่หลากหลายเกี่ยวกับสถานการณ์พืชกระท่อม ซึ่งเชื่อว่าจะเป็นประโยชน์อย่างมากต่อการนำไปใช้ในการปฏิบัติงานคุ้มครองผู้บริโภคในพื้นที่ต่อไปค่ะ</p><div><br></div>ขอเสียงปรบมือให้กับวิทยากรและผู้ดำเนินรายการทุกท่านอีกครั้งค่ะ</div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">เป็นอันเสร็จสิ้นภารกิจด้านวิชาการของวันนี้แล้วนะครับ ระหว่างเวลา 18.00–19.00 น. ขอเรียนเชิญทุกท่านรับประทานอาหารเย็น และเตรียมความพร้อมสำหรับกิจกรรมภาคค่ำ ซึ่งจะเป็นงานเลี้ยงแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการ ณ ห้องราชาเทวะแห่งนี้ครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">สำหรับภารกิจเสวนาทางวิชาการของเราในวันนี้ได้เสร็จสิ้นแล้วนะครับ</p><p class="isSelectedEnd">หลังจากนี้ ในช่วงเวลา <strong>18.00 – 19.00 น.</strong> ขอเรียนเชิญทุกท่านรับประทานอาหารเย็น และเตรียมความพร้อมสำหรับกิจกรรมภาคค่ำครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">ซึ่งในค่ำคืนนี้จะเป็น<strong>งานเลี้ยงแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการ</strong> ณ ห้องราชาเทวะแห่งนี้ครับ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">แล้วพบกันในบรรยากาศที่เป็นกันเองมากขึ้นในช่วงค่ำนี้นะคะ รับรองว่าบรรยากาศจะเปลี่ยนไปอย่างสิ้นเชิง สนุกสนาน อบอุ่น เป็นกันเองแน่นอนค่ะ! [ระบุธีม/การแต่งกายภาคค่ำ หากมี] ขอบคุณค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">ช่วงค่ำนี้เราจะเปลี่ยนบรรยากาศจากห้องประชุม มาเป็นบรรยากาศที่สบาย ๆ และเป็นกันเองมากขึ้นนะคะ</p><p class="isSelectedEnd">ขอให้ทุกท่านพักผ่อนตามสบาย เตรียมตัวให้พร้อม แล้วมาพบกันในงานเลี้ยงแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการในช่วงค่ำนี้ค่ะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">รับรองว่าบรรยากาศจะอบอุ่น สนุกสนาน และเป็นกันเองอย่างแน่นอนค่ะ</p><p class="isSelectedEnd"><strong>[ระบุธีม/การแต่งกายภาคค่ำ หากมี]</strong></p><p>แล้วพบกันในช่วงค่ำนี้นะคะ ขอบคุณค่ะ</p></div></div>
 
     <div class="section-divider"><span>18.00 – 19.00 น. · รับประทานอาหารเย็น</span></div>
   </div><!-- /seg2 -->
@@ -331,17 +728,17 @@
 
     <div class="section-divider"><span>18.00 น. · ต้อนรับแขก เตรียมความพร้อม</span></div>
 
-    <div class="line"><div class="speaker-tag all">ศรัณยู & ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);"><strong>สวัสดีค่ะ / ครับทุกท่าน! ยินดีต้อนรับสู่ค่ำคืนแห่งความประทับใจ!</strong></div></div>
+    <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);"><p class="isSelectedEnd"><b>สวัสดีค่ะ / ครับทุกท่าน!</b></p><p><b>ยินดีต้อนรับเข้าสู่ค่ำคืนแห่งความประทับใจของพวกเราทุกคนครับ/ค่ะ</b></p></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">สวัสดีอีกครั้งครับทุกท่าน ยินดีต้อนรับเข้าสู่บรรยากาศงานเลี้ยงยามค่ำคืนนะครับ บรรยากาศตอนนี้แตกต่างจากช่วงเช้ากับบ่ายที่ผ่านมาโดยสิ้นเชิงเลยนะครับ!</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd">สวัสดีอีกครั้งครับทุกท่าน</p><p class="isSelectedEnd">หลังจากที่เราใช้เวลาร่วมกันมาตลอดทั้งวัน ทั้งฟังบรรยาย ทั้งอภิปราย ทั้งแลกเปลี่ยนความรู้กันมาอย่างเต็มที่แล้ว...</p><p class="isSelectedEnd">ตอนนี้ได้เวลาพักสมองกันบ้างแล้วครับ!</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">- จากบรรยากาศเมื่อช่วงเช้าและช่วงบ่ายที่เต็มไปด้วยสาระและความรู้&nbsp;</p><p class="isSelectedEnd">วันนี้เราจะเปลี่ยนบรรยากาศกันสักหน่อยครับ&nbsp;</p><p class="isSelectedEnd">- จากห้องประชุม...มาเป็นห้องแห่งรอยยิ้ม</p><p>- จากวิชาการ...มาเป็นมิตรภาพ<br></p>- และจากการนั่งฟัง...คืนนี้ขอให้ทุกท่านได้พูดคุย ร้องเพลง และสนุกสนานกันอย่างเต็มที่ครับ</div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">คืนนี้เราจะมาร่วมกันแสดงมุทิตาจิต ส่งความรัก ความผูกพัน และคำขอบคุณให้กับพี่ ๆ ผู้เกษียณอายุราชการของเรา ที่ได้ทุ่มเททำงานเพื่อพี่น้องประชาชนมาตลอดหลายสิบปีค่ะ ระหว่างที่รอความพร้อม ขอเชิญทุกท่านรับประทานอาหารและพูดคุยกันตามอัธยาศัยก่อนนะคะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">คืนนี้เป็นค่ำคืนพิเศษของพวกเราค่ะ เพราะเราจะมาร่วมกันแสดงมุทิตาจิต และส่งความรัก ความผูกพัน และคำขอบคุณให้กับ <strong>พี่ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่าน</strong></p><p class="isSelectedEnd">ทุกท่านได้ทุ่มเทแรงกาย แรงใจ และความรู้ความสามารถในการทำงานเพื่อพี่น้องประชาชนมาอย่างยาวนาน</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">คืนนี้จึงถือเป็นโอกาสดีที่พวกเราจะได้มาร่วมกันบอกว่า</p><p><strong>“ขอบคุณสำหรับทุกสิ่งที่พี่ๆ ได้ทำให้พวกเรานะคะ”</strong></p><p><strong><br></strong></p><p class="isSelectedEnd"><strong>ศรัณยู:</strong><br>และคืนนี้ไม่ต้องห่วงเรื่องงานครับ</p><p class="isSelectedEnd">ไม่ต้องคิดเรื่องเอกสาร<br>ไม่ต้องคิดเรื่องรายงาน<br>ไม่ต้องคิดเรื่องตัวชี้วัด...</p><p class="isSelectedEnd">คืนนี้คิดอย่างเดียวครับว่า <strong>กินให้อิ่ม ยิ้มให้กว้าง และสนุกให้เต็มที่!</strong> 😄</p><p class="isSelectedEnd"><strong>ใหม่:</strong><br>แต่ก่อนที่จะไปถึงช่วงสำคัญของค่ำคืนนี้ ระหว่างที่รอความพร้อมของงาน ขอเชิญทุกท่านรับประทานอาหาร พูดคุย และทักทายกันตามอัธยาศัยก่อนนะคะ</p><p class="isSelectedEnd">โดยเฉพาะท่านที่ยังไม่ได้มีโอกาสพูดคุยกับพี่ ๆ ผู้เกษียณ อย่าลืมแวะไปทักทาย ไปถ่ายรูป และเก็บภาพความประทับใจร่วมกันนะคะ</p><p class="isSelectedEnd">คืนนี้เราไม่ได้มาประชุมค่ะ...</p><p class="isSelectedEnd"><strong>เรามาแสดงความรักและความผูกพันให้กับพี่ ๆ ของเราค่ะ</strong></p><p class="isSelectedEnd"><strong>ศรัณยู:</strong><br>ถูกต้องครับ และที่สำคัญ คืนนี้พวกเรามีผู้เกษียณอายุราชการถึง <strong>6 ท่าน</strong> ที่เราจะร่วมกันแสดงมุทิตาจิต&nbsp;</p><p class="isSelectedEnd">รับรองว่าคืนนี้มีทั้งรอยยิ้ม เสียงหัวเราะ ความประทับใจ และอาจมีน้ำตาแห่งความปลื้มปริ่มกันบ้างครับ เพราะฉะนั้น ขอให้ทุกท่านเตรียมตัว เตรียมใจ และเตรียมเสียงปรบมือกันไว้ให้พร้อมนะครับ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd"><strong>ใหม่:</strong><br>ระหว่างนี้ ขอเชิญทุกท่านรับประทานอาหารและพูดคุยกันตามอัธยาศัยก่อนนะคะ</p><p class="isSelectedEnd">แล้วอีกสักครู่ เราจะเข้าสู่ช่วงสำคัญของค่ำคืนนี้ค่ะ</p><div contenteditable="false"><hr></div><h3></h3></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> ทีมดูแลผู้เกษียณติดเข็มกลัดหน้าอกด้านซ้าย · น้องป๊อบติดดอกไม้ให้ VIP · เชิญผู้เกษียณและเภสัชกรเชี่ยวชาญนั่งโต๊ะ VIP · พี่หงษ์แจ้งคิวพิธีกรเมื่อผู้เกษียณมาครบ · น้องโย/น้องโจ้เตรียมเพลงเปิดตัว</div>
+    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong><div>- ทีมดูแลผู้เกษียณติดเข็มกลัดบริเวณหน้าอกด้านซ้าย</div><div>- น้องป๊อบติดดอกไม้ให้ VIP</div><div>- เชิญผู้เกษียณและเภสัชกรเชี่ยวชาญนั่งโต๊ะ VIP</div><div>- พี่หงษ์แจ้งคิวพิธีกรเมื่อผู้เกษียณมาครบ</div><div>- น้องโย/น้องโจ้เตรียมเพลงเปิดตัว</div><div>- ตรวจสอบไมโครโฟนสำหรับพิธีกรและผู้เกษียณ</div><div>- ตรวจสอบภาพ/สไลด์หรือวีดิทัศน์ที่จะใช้ในช่วงแนะนำผู้เกษียณทีมดูแลผู้เกษียณ</div></div>
 
     <div class="section-divider"><span>18.30 น. · ขบวนเปิดตัวผู้เกษียณอายุราชการ</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">และแล้วก็ถึงช่วงเวลาที่ทุกคนรอคอยครับ! ขอเชิญทุกท่านร่วมส่งเสียงต้อนรับผู้เกษียณอายุราชการของเราทั้ง 6 ท่าน ที่กำลังจะเดินเข้าสู่เวทีแห่งความประทับใจในค่ำคืนนี้!</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p class="isSelectedEnd"><span style="background-color: rgba(26, 74, 107, 0.03);">และแล้วก็ถึงช่วงเวลาที่ทุกคนรอคอยครับ!&nbsp;</span></p><p class="isSelectedEnd"><span style="background-color: rgba(26, 74, 107, 0.03);">ขอเชิญทุกท่านร่วมส่งเสียงต้อนรับผู้เกษียณอายุราชการของเราทั้ง 6 ท่าน</span></p><p class="isSelectedEnd"><span style="background-color: rgba(26, 74, 107, 0.03);">ที่กำลังจะเดินเข้าสู่เวทีแห่งความประทับใจในค่ำคืนนี้กันครับ!</span></p></div></div>
 
     <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอเสียงปรบมือดัง ๆ ต้อนรับกันหน่อยค่ะ!</div></div>
 
@@ -356,66 +753,104 @@
         <li><strong>ภก. ภาณุ ศรีวรรัตน์</strong> — เภสัชกรเชี่ยวชาญ สำนักงานสาธารณสุขจังหวัดจันทบุรี</li>
         <li><strong>ภญ. ปิยะวรรณ จันทรสวัสดิ์</strong> — เภสัชกรชำนาญการพิเศษ โรงพยาบาลธัญบุรี จังหวัดปทุมธานี</li>
       </ol>
-      <div class="sub">หมายเหตุ: ภก. ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ นั่งเป็น VIP ตั้งแต่ต้นงาน ไม่อยู่ในขบวนเปิดตัวนี้</div>
+      <div class="sub">หมายเหตุ: ภก. ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ นั่งเป็น VIP ตั้งแต่ต้นงาน&nbsp;</div><div class="sub">ไม่อยู่ในขบวนเปิดตัวนี้</div>
     </div>
 
-    <div class="line"><div class="speaker-tag all">ศรัณยู & ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);">ขอเชิญทุกท่านปรบมือต้อนรับผู้เกษียณอายุราชการของเราอีกครั้งค่ะ/ครับ!</div></div>
+    <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);">ขอเชิญทุกท่านปรบมือต้อนรับผู้เกษียณอายุราชการของเราอีกครั้งค่ะ/ครับ!</div></div>
 
     <div class="direction">⏸️ (ผู้เกษียณนั่งประจำโต๊ะ VIP เรียบร้อย)</div>
 
     <div class="section-divider"><span>19.00 น. · กล่าวต้อนรับผู้เข้าร่วมงาน</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ก่อนอื่น ในนามคณะผู้จัดงาน ดิฉันและคุณศรัณยูขอกล่าวต้อนรับทุกท่านเข้าสู่ค่ำคืนแห่งความประทับใจในวันนี้อีกครั้งค่ะ คืนนี้ขอให้ทุกท่านผ่อนคลาย สนุกสนาน อิ่มอร่อย และเก็บภาพความประทับใจกลับบ้านกันเยอะ ๆ นะคะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p class="isSelectedEnd">ก่อนอื่น ในนามคณะผู้จัดงาน ดิฉันและคุณศรัณยู ขอขอต้อนรับทุกท่านเข้าสู่ค่ำคืนแห่งความประทับใจในวันนี้อีกครั้งนะคะ</p><p class="isSelectedEnd"><br></p><p class="isSelectedEnd">หลังจากที่เราได้ใช้เวลาร่วมกันมาตลอดทั้งวัน ทั้งประชุม ทั้งแลกเปลี่ยนความรู้กันมาอย่างเต็มที่แล้ว คืนนี้ก็ขอให้ทุกท่านได้ผ่อนคลายกันอย่างเต็มที่นะคะ</p><p class="isSelectedEnd"><br></p>ขอให้รับประทานอาหารให้อิ่ม อิ่มแล้วก็พูดคุยกันให้สนุก&nbsp;<div>และที่สำคัญอย่าลืมเก็บภาพความประทับใจกลับไปฝากคนที่บ้านกันเยอะ ๆ นะคะะ</div></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">คืนนี้เราเตรียมทั้งการแสดงและวีดิทัศน์ความประทับใจ รวมทั้งช่วงเวลาพิเศษที่จะให้ทุกท่านได้ร่วมส่งมอบความสุขให้กับพี่ ๆ ผู้เกษียณครับ ขอให้ทุกท่านรับประทานอาหารและเครื่องดื่มไปพร้อมกับความสนุกตลอดค่ำคืนนี้กันนะครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><div><p class="isSelectedEnd">คืนนี้เราเตรียมทั้งการแสดง วีดิทัศน์ความประทับใจ และช่วงเวลาพิเศษต่าง ๆ เพื่อให้ทุกท่านได้ร่วมกันส่งมอบความสุข ความรัก และความขอบคุณให้กับพี่ ๆ ผู้เกษียณอายุราชการของเราครับ</p><p>เพราะฉะนั้น คืนนี้ไม่ต้องรีบกลับนะครับ รับประทานอาหารและเครื่องดื่มไปด้วย พูดคุยกับพี่ ๆ น้อง ๆ ไปด้วย และร่วมสนุกกับกิจกรรมต่าง ๆ ที่เราเตรียมไว้ตลอดค่ำคืนนี้ครับ</p></div></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> น้องบุ๋มแจ้ง Serve Wine ที่โต๊ะ VIP และเสิร์ฟเครื่องดื่มแอลกอฮอล์</div>
+    <div class="cue-box editable"><strong>Cue เจ้าหน้าที่:</strong>&nbsp;<li>น้องบุ๋มแจ้ง Serve Wine ที่โต๊ะ VIP</li><li>เสิร์ฟเครื่องดื่มแอลกอฮอล์ตามลำดับ</li><li>ตรวจสอบความพร้อมเวทีและระบบเสียงสำหรับการแสดง</li></div>
 
     <div class="section-divider"><span>19.15 น. · การแสดง "จินตลีลา สีสันภาคกลาง"</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ลำดับต่อไป ขอเชิญทุกท่านรับชมการแสดงชุดพิเศษที่ทีมงานเตรียมมาให้ทุกท่านได้อิ่มเอมใจ กับการแสดงชุด <strong>"จินตลีลา สีสันภาคกลาง"</strong> โดยทีม S.P.A.D. น้อง ๆ นักเรียนจากโรงเรียนสมุทรปราการค่ะ ขอเชิญชมพร้อมกันเลยค่ะ!</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="1248" data-end="1336" class="PDq2pG_selectionAnchorContainer">และเพื่อเป็นการเริ่มต้นงานแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการอย่างเป็นทางการ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1338" data-end="1553">ลำดับต่อไป&nbsp;</p><p data-start="1338" data-end="1553">ขอเรียนเชิญ <strong data-start="1361" data-end="1388">นายรังสรรค์ วงษ์บุญหนัก</strong><br data-start="1388" data-end="1391">
+รองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ<br data-start="1429" data-end="1432">
+ขึ้นประจำที่ด้านบนเวที เพื่อรับฟังวัตถุประสงค์ของการจัดงาน และกล่าวเปิดงานแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการ ตามลำดับค่ะ</p><div><p data-start="1571" data-end="1725" class="PDq2pG_selectionAnchorContainer"><br></p><p data-start="1571" data-end="1725" class="PDq2pG_selectionAnchorContainer"><b>ศรัณยู:&nbsp;</b></p><p data-start="1571" data-end="1725" class="PDq2pG_selectionAnchorContainer">และขอเรียนเชิญ <strong data-start="1600" data-end="1635">นางสาวณัฐยาภรณ์ วงษ์บุญเกื้อกูล</strong><br data-start="1635" data-end="1638">
+หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข<br data-start="1687" data-end="1690">
+สำนักงานสาธารณสุขจังหวัดสมุทรปราการ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1727" data-end="1763">กล่าวรายงานวัตถุประสงค์การจัดงานครับ</p>
+<p data-start="1765" data-end="1780"><strong data-start="1784" data-end="1797"><br></strong></p><p data-start="1765" data-end="1780"><strong data-start="1784" data-end="1797">หมายเหตุ:</strong> หากลำดับพิธีจริงเป็น “กล่าวรายงาน → กล่าวเปิดงาน” แนะนำให้ <strong data-start="1857" data-end="1903">ศรัณยูเชิญนางสาวณัฐยาภรณ์ฯ กล่าวรายงานก่อน</strong> แล้วจึงเชิญนายรังสรรค์ฯ กล่าวเปิดงาน เพื่อให้ตรงตามลำดับพิธีครับ</p></div></div></div>
 
     <div class="direction">🎵 (การแสดง "จินตลีลา สีสันภาคกลาง")</div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">สวยงามมากเลยใช่ไหมครับทุกท่าน! ขอเสียงปรบมือดัง ๆ ให้กับน้อง ๆ นักแสดงอีกครั้งครับ 👏 ขอขอบคุณคุณครูชลดา สุขทอง ผู้ฝึกซ้อม พร้อมทีมงานโรงเรียนสมุทรปราการทุกท่านด้วยนะครับ ที่สละเวลามาสร้างความประทับใจให้กับพวกเราในวันนี้ครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="2021" data-end="2151" class="PDq2pG_selectionAnchorContainer"><b>19.15 น. · การแสดง “จินตลีลา สีสันภาคกลาง”</b></p><p data-start="2021" data-end="2151" class="PDq2pG_selectionAnchorContainer"><b>ใหม่:&nbsp;</b></p><p data-start="2021" data-end="2151" class="PDq2pG_selectionAnchorContainer">และหลังจากเสร็จสิ้นช่วงพิธีการแล้ว เรามาผ่อนคลายกันต่อด้วยการแสดงพิเศษที่ทีมงานตั้งใจเตรียมมาให้ทุกท่านได้รับชมกันนะคะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="2021" data-end="2151" class="PDq2pG_selectionAnchorContainer"><br></p>
+<p data-start="2153" data-end="2220">ลำดับต่อไป ขอเชิญทุกท่านรับชมการแสดงชุด <strong data-start="2193" data-end="2220">“จินตลีลา สีสันภาคกลาง”</strong></p>
+<p data-start="2222" data-end="2282">โดยทีม <strong data-start="2229" data-end="2241">S.P.A.D.</strong> น้อง ๆ นักเรียนจากโรงเรียนสมุทรปราการค่ะ</p>
+<p data-start="1765" data-end="1780">ขอเชิญทุกท่านรับชมพร้อมกันเลยค่ะ</p><p data-start="1765" data-end="1780"><br></p><p data-start="2360" data-end="2442" class="PDq2pG_selectionAnchorContainer">ขอบคุณสำหรับการแสดงที่สวยสดงดงามจากน้อง ๆ โรงเรียนสมุทรปราการมากครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1765" data-end="1780">ขอขอบคุณ&nbsp;<strong data-start="2453" data-end="2474">คุณครูชลดา สุขทอง</strong> ผู้ฝึกซ้อม และทีมงานทุกท่านด้วยนะครับ ที่มาร่วมสร้างสีสันและความประทับใจให้กับพวกเราในค่ำคืนนี้ครับ</p><p data-start="1765" data-end="1780"><br></p><p data-start="1765" data-end="1780">ขอเสียงปรบมือให้น้อง ๆ และทีมงานอีกครั้งครับ</p></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> พี่เนะดูแลเงินมอบให้นักแสดงและนักดนตรี รวมถึงอาหารและรถรับส่งสำหรับนักแสดง</div>
+    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong>&nbsp;<div><strong data-start="2826" data-end="2853">ไม่ต้องแจ้ง Cue ออกไมค์</strong><br><li data-section-id="11sdsk7" data-start="2648" data-end="2706">นักแสดงแต่งตัวเตรียมพร้อมที่ห้องประชุมชั้น 6 (ข้างลิฟท์)<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span>
+</li>
+<li data-section-id="19jxlp1" data-start="2707" data-end="2745">
+น้องโย/น้องโจ้ เปิดเพลงประกอบการแสดง
+</li>
+<li data-section-id="mf2dp0" data-start="2746" data-end="2823">
+พี่เนะดูแลเงินมอบให้นักแสดงและนักดนตรี รวมถึงอาหาร และรถรับส่งสำหรับนักแสดง</li></div></div>
 
     <div class="section-divider"><span>19.30 น. · พิธีมุทิตาจิต</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ลำดับต่อไป ขอเรียนเชิญ <strong>นายรังสรรค์ วงษ์บุญหนัก</strong> รองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ กล่าวเปิดงานแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการค่ะ ขอเรียนเชิญค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="2896" data-end="2952" class="PDq2pG_selectionAnchorContainer">ลำดับต่อไป ขอเข้าสู่ช่วงสำคัญของค่ำคืนนี้ค่ะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="2954" data-end="3034">ขอเรียนเชิญ <strong data-start="2966" data-end="2993">นายรังสรรค์ วงษ์บุญหนัก</strong><br data-start="2993" data-end="2996">
+รองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ</p>
+กล่าวเปิดงานแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการค่ะ<div>/ขอเรียนเชิญค่ะ</div></div></div>
 
     <div class="direction">⏸️ (รองนายแพทย์สาธารณสุขจังหวัดกล่าวเปิดงาน)</div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอบพระคุณท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการเป็นอย่างสูงครับ ในโอกาสนี้ ขอเรียนเชิญ <strong>ภก. ประสาท ลิ่มดุลย์</strong> ข้าราชการบำนาญ ในฐานะรุ่นพี่ผู้อาวุโส กล่าวแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการรุ่นน้องในปีนี้ครับ ขอเรียนเชิญครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="3125" data-end="3206" class="PDq2pG_selectionAnchorContainer">ขอบพระคุณท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการเป็นอย่างสูงครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="3208" data-end="3314"><br></p><p data-start="3208" data-end="3314">ลำดับต่อไป ขอเรียนเชิญ&nbsp;<strong data-start="3231" data-end="3269">ภก.ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ</strong>&nbsp;</p><p data-start="3208" data-end="3314"><span class="rQesXe MPyX" data-sfc-cp="" jsaction="" jscontroller="tP2kf#s32ZS" data-sfc-root="ep" jsuid="q6PNdb_15" data-complete="true" data-copy-service-computed-style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; font-weight: 700; margin: 0px; text-decoration: none; border-bottom: 0px rgb(10, 10, 10);" style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; font-weight: 700; border-bottom: 0px rgb(10, 10, 10);">นายกสมาคมเภสัชสาธารณสุขแห่งประเทศไทย</span>&nbsp;</p><p data-start="3208" data-end="3314">(สมาคมเภสัชสาธารณสุขจังหวัดแห่งประเทศไทย)</p><p data-start="3208" data-end="3314">ผู้ทรงคุณวุฒิและเภสัชกรที่มีบทบาทสำคัญในวงการเภสัชกรรมและการสาธารณสุขของประเทศไทย&nbsp;</p><p data-start="3208" data-end="3314">ในฐานะรุ่นพี่ผู้อาวุโส กล่าวแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการรุ่นน้องในปีนี้ครับ /ขอเรียนเชิญครับครับ</p></div></div>
 
     <div class="direction">⏸️ (ภก.ประสาทกล่าวแสดงมุทิตาจิต)</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอบพระคุณค่ะ และหลังจากนี้ ขอเชิญทุกท่านร่วมรับชมวีดิทัศน์ที่ทีมงานตั้งใจรวบรวมประวัติ ผลงาน และความประทับใจของพี่ ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่านของเราค่ะ เตรียมทิชชู่ไว้ด้วยนะคะ เพราะบางช่วงอาจทำให้ใครหลายคนต้องเช็ดน้ำตา!</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอบพระคุณค่ะ&nbsp;<div>และหลังจากนี้ ขอเชิญทุกท่านร่วมรับชมวีดิทัศน์ที่ทีมงานตั้งใจรวบรวมประวัติ&nbsp;</div><div>ผลงาน และความประทับใจของพี่ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่านของเราค่ะ&nbsp;</div><div><p data-start="3393" data-end="3504" class="PDq2pG_selectionAnchorContainer"><br></p><p data-start="3393" data-end="3504" class="PDq2pG_selectionAnchorContainer">เชื่อว่าวีดิทัศน์ชุดนี้จะพาเราไปย้อนดูเรื่องราวดีๆ และความทรงจำตลอดช่วงเวลาการทำงานของพี่ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่านนะคะ</p><p data-start="3393" data-end="3504" class="PDq2pG_selectionAnchorContainer">ขอเชิญทุกท่านรับชมพร้อมกันค่ะ</p></div></div></div>
 
     <div class="direction">🎬 (ฉายวีดิทัศน์ประวัติ ผลงาน และความประทับใจ)</div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> น้องโยและน้องโจ้ดูแลความพร้อมของวีดิทัศน์</div>
+    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong>&nbsp;<li data-section-id="1i6txcs" data-start="3712" data-end="3738">เชิญรอง นพ.สสจ. ขึ้นเวที<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span>
+</li>
+<li data-section-id="1dwa28v" data-start="3739" data-end="3782">
+น้องโยและน้องโจ้ดูแลความพร้อมของวีดิทัศน์</li></div>
 
-    <div class="backup-box editable">🎞️ <strong>Backup หากวีดิทัศน์ขัดข้องหรือโหลดช้า:</strong> "เรียนทุกท่านครับ/ค่ะ ระหว่างที่เจ้าหน้าที่กำลังเตรียมความพร้อมของวีดิทัศน์ ขอเชิญทุกท่านยกแก้วดื่มอวยพรให้กับผู้เกษียณอายุราชการของเราไปพลาง ๆ ก่อนนะครับ/คะ"</div>
+    <div class="backup-box editable">🎞️ <strong>Backup หากวีดิทัศน์ขัดข้องหรือโหลดช้า:</strong>&nbsp;<div>"เรียนทุกท่านครับ/ค่ะ ระหว่างที่เจ้าหน้าที่กำลังเตรียมความพร้อมของวีดิทัศน์ ขอเชิญทุกท่านยกแก้วดื่มอวยพรให้กับผู้เกษียณอายุราชการของเราไปพลาง ๆ ก่อนนะครับ/คะ"</div></div>
 
     <div class="section-divider"><span>19.45 น. · เรื่องเล่าจากใจ · ผู้เกษียณอายุราชการ</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ดูวีดิทัศน์จบแล้ว เชื่อว่าหลายท่านคงอยากฟังเสียงจากพี่ ๆ ตัวจริงกันแล้วใช่ไหมครับ! และตอนนี้ก็ถึงช่วงเวลาสำคัญของค่ำคืนนี้แล้วครับ ขอเรียนเชิญผู้เกษียณอายุราชการทั้ง 6 ท่าน ขึ้นสู่เวทีเพื่อกล่าวแสดงความรู้สึกในวาระเกษียณอายุราชการครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ดูวีดิทัศน์จบแล้ว เชื่อว่าหลายท่านคงอยากฟังเสียงจากพี่ๆ ตัวจริงกันแล้วใช่ไหมครับ! และตอนนี้ก็มาถึงอีกหนึ่งช่วงเวลาสำคัญของค่ำคืนนี้แล้วครับ<p data-start="4258" data-end="4361" class="PDq2pG_selectionAnchorContainer">ช่วงเวลาที่พวกเราทุกคนจะได้ร่วมกันส่งมอบกำลังใจและความรัก</p><p data-start="4258" data-end="4361" class="PDq2pG_selectionAnchorContainer">ให้กับพี่ๆ ผู้เกษียณอายุราชการทั้ง <span data-start="4351" data-end="4361" style="">6 ท่าน</span><span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<div><br></div><div>ลำดับต่อไป ขอเรียนเชิญผู้เกษียณอายุราชการทั้ง 6 ท่าน ขึ้นสู่เวที เ</div><div>พื่อกล่าวแสดงความรู้สึกในวาระเกษียณอายุราชการครับ</div><div><br></div><div>ขอเสียงปรบมือต้อนรับพี่ ๆ ผู้เกษียณทั้ง 6 ท่านด้วยครับ&nbsp;</div></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> น้องหงส์เดินนำและเชิญผู้เกษียณขึ้นเวที · ทีมแจกดอกไม้ (หงส์/หนิง/ป๊อบ/กวาง/บุ๋ม) แจกให้ผู้เข้าร่วมประชุมคนละ 1 ดอก · น้องยุ้ยดูแลดอกไม้แจกผู้เกษียณ</div>
+    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong>&nbsp;<li data-section-id="166oh65" data-start="4566" data-end="4611"><strong data-start="4568" data-end="4580">น้องหงส์</strong> เดินนำและเชิญผู้เกษียณขึ้นเวที<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span>
+</li>
+<li data-section-id="1bueral" data-start="4612" data-end="4753">
+<strong data-start="4614" data-end="4631">ทีมแจกดอกไม้:</strong> หงส์ / หนิง / ป๊อบ / กวาง / บุ๋ม&nbsp;</li><li data-section-id="1bueral" data-start="4612" data-end="4753">แจกดอกไม้ให้ผู้เข้าร่วมประชุมคนละ 1 ดอก (ตะกร้าที่เหลือวางข้างเวทีทางขึ้นด้านซ้าย)</li>
+<li data-section-id="ln5ow7" data-start="4754" data-end="4831">
+<strong data-start="4756" data-end="4768">น้องยุ้ย&nbsp;</strong>ดูแลดอกไม้สำหรับแจกผู้เกษียณ (ตะกร้าที่เหลือวางข้างเวที)</li></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">หลังจากรับฟังความรู้สึกอันซาบซึ้งจากพี่ ๆ ผู้เกษียณแล้ว ลำดับต่อไป ขอเรียนเชิญนายรังสรรค์ วงษ์บุญหนัก รองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ มอบของที่ระลึกจากกลุ่มงานคุ้มครองผู้บริโภคฯ สสจ.สมุทรปราการ แด่ผู้เกษียณอายุราชการค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">หลังจากรับฟังความรู้สึกอันซาบซึ้งจากพี่ ๆ ผู้เกษียณแล้ว&nbsp;<div>ลำดับต่อไป <b>ขอเรียนเชิญนายรังสรรค์ วงษ์บุญหนัก </b>รองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ มอบของที่ระลึกจากกลุ่มงานคุ้มครองผู้บริโภคฯ สำนักงานสาธารณสุขจังหวัดสมุทรปราการ แด่ผู้เกษียณอายุราชการทั้ง 6 ท่านค่ะ</div>
+<p data-start="557" data-end="571">ขอเรียนเชิญค่ะ</p><p data-start="557" data-end="571"><b>[ดำเนินการมอบของที่ระลึก]</b></p><div><strong data-start="4833" data-end="4848"><br></strong></div><div><strong data-start="4833" data-end="4848">จังหวะพิธี:</strong><br data-start="4848" data-end="4851">
+เมื่อผู้เกษียณทั้ง 6 ท่านขึ้นเวทีเรียบร้อยแล้ว</div><div>พิธีกรกล่าวต้อนรับ/แนะนำเข้าสู่ช่วงกล่าวความรู้สึก&nbsp;</div><div>→ ดำเนินการตามลำดับรายบุคคล&nbsp;</div><div>→ มอบของที่ระลึก/ดอกไม้ตามลำดับที่กำหนด</div></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">เรียนเชิญผู้เข้าร่วมประชุมทุกท่านร่วมถ่ายภาพกับผู้เกษียณอายุราชการเป็นที่ระลึกด้วยกันครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="604" data-end="685" class="PDq2pG_selectionAnchorContainer">ขอบพระคุณท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการเป็นอย่างสูงครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="687" data-end="817">และในโอกาสนี้ ขอเรียนเชิญผู้เข้าร่วมประชุมทุกท่าน&nbsp;</p><p data-start="687" data-end="817">ร่วมถ่ายภาพกับผู้เกษียณอายุราชการทั้ง 6 ท่าน เพื่อเก็บไว้เป็นที่ระลึกร่วมกันครับ<br></p></div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> พี่ตุ๊กดูแลของที่ระลึก · พี่แอร์ดูแลถุงใส่ของที่ระลึก · พี่ตุ๊ก พี่หงษ์ หนิง ป๊อบ กวาง บุ๋ม ยืนประกบด้านหลังผู้เกษียณ 1:1 เพื่อช่วยรับของ</div>
+    <div class="cue-box editable"><strong>Cue เจ้าหน้าที่:</strong>&nbsp;<div><b>พี่ตุ๊ก -&nbsp;</b>ดูแลของที่ระลึก <b>· </b>พี่แอร์ดูแลถุงใส่ของที่ระลึก ·&nbsp;</div><div><b>พี่ตุ๊ก พี่หงษ์ หนิง ป๊อบ กวาง บุ๋ม -&nbsp;</b>ยืนประกบด้านหลังผู้เกษียณ 1:1 เพื่อช่วยรับของ</div><div><b>ถ่ายภาพ 1 : 1 ตอนมอบของที่ระลึก </b>แล้วให้ผู้เกษียณยืนด้านข้างเวที (ไม่ติดเฟรมภาพ) แล้วจึงขึ้นมาถ่ายรูปรวมอีกที</div></div>
 
     <div class="section-divider"><span>20.00 – 20.30 น. · มอบดอกไม้มุทิตาจิต / ถ่ายภาพร่วมกัน</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอเรียนเชิญผู้บริหาร ผู้ร่วมงาน และแขกผู้มีเกียรติทุกท่าน ร่วมมอบดอกไม้และแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการ พร้อมบันทึกภาพร่วมกันเป็นที่ระลึกค่ะ เชิญได้เลยค่ะ!</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="1117" data-end="1291" class="PDq2pG_selectionAnchorContainer">และต่อจากนี้ ขอเชิญผู้บริหาร ผู้ร่วมงาน และแขกผู้มีเกียรติทุกท่าน ร่วมมอบดอกไม้และแสดงมุทิตาจิตแด่ผู้เกษียณอายุราชการทั้ง 6 ท่าน</p><p data-start="1117" data-end="1291" class="PDq2pG_selectionAnchorContainer">พร้อมร่วมบันทึกภาพเป็นที่ระลึกค่ะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="1117" data-end="1291" class="PDq2pG_selectionAnchorContainer"><br></p>
+<p data-start="1293" data-end="1398">ช่วงเวลานี้ถือเป็นโอกาสดีที่พวกเราจะได้ส่งมอบทั้งดอกไม้ รอยยิ้ม&nbsp;</p><p data-start="1293" data-end="1398">และความปรารถนาดีให้กับพี่ ๆ ผู้เกษียณนะคะ</p>
+ขอเชิญทุกท่านร่วมแสดงมุทิตาจิตตามลำดับที่ทีมงานจัดไว้ได้เลยค่ะ<div>&nbsp;</div><div><b>Cue เจ้าหน้าที่</b></div><div>- จัดคิวผู้เข้าร่วมงานให้เป็นระเบียบระหว่างมอบดอกไม้</div><div>- ช่างภาพประจำจุดถ่ายภาพตลอดช่วงนี้</div><div>- ทีมงานคอยเชิญผู้ร่วมงานตามลำดับ</div><div>- น้องยุ้ยดูแลดอกไม้สำหรับผู้เกษียณ</div></div></div>
 
-    <div class="backup-box editable">🕐 <strong>Backup หากคิวมอบดอกไม้ใช้เวลานาน:</strong> "เรียนทุกท่านครับ/ค่ะ ระหว่างรอคิวมอบดอกไม้ ขอเชิญทุกท่านที่รอคิวรับประทานอาหารและพูดคุยกันไปพลาง ๆ ก่อนได้เลยนะครับ/คะ ทีมงานจะเชิญทุกท่านเป็นระยะ ๆ ค่ะ"</div>
+    <div class="backup-box editable">🕐 <strong>Backup หากคิวมอบดอกไม้ใช้เวลานาน:</strong>&nbsp;<p data-start="1691" data-end="1776" class="PDq2pG_selectionAnchorContainer"><b>ศรัณยู:</b></p><p data-start="1691" data-end="1776" class="PDq2pG_selectionAnchorContainer">เรียนทุกท่านครับ ระหว่างที่เรากำลังทยอยมอบดอกไม้และถ่ายภาพกันอยู่นะครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1778" data-end="1856">ท่านใดที่ยังไม่ได้ถึงคิว สามารถรับประทานอาหารและพูดคุยกันตามสบายก่อนได้เลยครับ</p>
+<div>เดี๋ยวทีมงานจะทยอยเชิญทุกท่านขึ้นมาร่วมแสดงมุทิตาจิตตามลำดับนะครับ</div><div><strong data-start="1926" data-end="1935"><br></strong></div><div><strong data-start="1926" data-end="1935">ใหม่:</strong><br data-start="1935" data-end="1938">
+ไม่ต้องรีบนะคะ ค่อย ๆ ทยอยขึ้นมากันค่ะ คืนนี้เราอยากให้ทุกท่านได้มีเวลาเก็บภาพและความประทับใจร่วมกับพี่ ๆ ผู้เกษียณให้เต็มที่ค่ะ</div><div><br></div></div>
 
     <div class="direction">📸 (ผู้ร่วมงานทยอยมอบดอกไม้และถ่ายภาพร่วมกับผู้เกษียณ)</div>
 
@@ -423,31 +858,56 @@
 
     <div class="note-box">🎙️ <strong>โทนการพูด:</strong> ช่วงนี้คือหัวใจของความสนุกในค่ำคืนนี้ เปลี่ยนโทนเป็นกันเอง มีมุกตลก คำถามชวนคุย และเปิดพื้นที่ให้ผู้เกษียณเล่าเรื่องสนุก ๆ (พูดคุยกันสบาย ๆ สไตล์ทอล์กโชว์)</div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">เป็นยังไงกันบ้างครับทุกท่าน อิ่มท้องอิ่มใจกันหรือยังครับ? ต่อไปนี้เราจะเปลี่ยนบรรยากาศกันสักหน่อยนะครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="2105" data-end="2223" class="PDq2pG_selectionAnchorContainer"><strong data-start="2105" data-end="2114">ใหม่:</strong><br data-start="2114" data-end="2117">เรียนท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ ผู้บริหาร ผู้เกษียณอายุราชการ และแขกผู้มีเกียรติทุกท่านค่ะ</p>
+<p data-start="2225" data-end="2303">สำหรับค่ำคืนแห่งความประทับใจของเราในวันนี้ .....</p><p data-start="2225" data-end="2303">ก็ได้ดำเนินมาถึงช่วงสุดท้ายแล้วนะคะ&nbsp;&nbsp;</p><p data-start="2225" data-end="2303"><br></p><p data-start="2225" data-end="2303">ตลอดค่ำคืนนี้ เราได้ร่วมกันทั้งรับประทานอาหาร ชมการแสดง&nbsp;</p><p data-start="2225" data-end="2303">รับชมเรื่องราวความประทับใจ</p><p data-start="2225" data-end="2303">และที่สำคัญที่สุด คือได้ร่วมกันส่งมอบความรัก ความผูกพัน&nbsp;</p><p data-start="2225" data-end="2303">และคำขอบคุณให้กับพี่ ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่านค่ะ</p><p data-start="2225" data-end="2303"><br></p>
+<p data-start="2502" data-end="2667">ในนามคณะผู้จัดงาน ดิฉันและคุณศรัณยู ขอกราบขอบพระคุณผู้เกษียณอายุราชการทุกท่าน สำหรับความทุ่มเท ความเสียสละ และความตั้งใจในการปฏิบัติหน้าที่ราชการตลอดเส้นทางที่ผ่านมา</p>
+<p data-start="2669" data-end="2741"><br></p><p data-start="2669" data-end="2741">และขอให้ค่ำคืนนี้เป็นอีกหนึ่งความทรงจำดี ๆ ที่พวกเราจะเก็บไว้ร่วมกันนะคะ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ใช่ค่ะ! ช่วงต่อไปนี้จะเป็นช่วง <strong>"เรื่องเล่าประสบการณ์ดำเนินงานคุ้มครองผู้บริโภค"</strong> ที่จะพาทุกท่านย้อนไปฟังเรื่องราวสนุก ๆ ซึ้ง ๆ และฮา ๆ ตลอดเส้นทางการทำงานของพี่ ๆ ผู้เกษียณกันค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="2743" data-end="2873"><b>ศรัณยู:</b></p><p data-start="2743" data-end="2873">และกระผมขอขอบพระคุณท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ&nbsp;</p><p data-start="2743" data-end="2873">ผู้บริหาร แขกผู้มีเกียรติ และผู้เข้าร่วมงานทุกท่านครับ</p><p data-start="2875" data-end="2981"><br></p><p data-start="2875" data-end="2981">ขอบพระคุณทุกท่านที่มาร่วมกันสร้างค่ำคืนนี้ให้เต็มไปด้วยรอยยิ้ม เสียงหัวเราะ ความอบอุ่น และความประทับใจครับ</p><p data-start="2983" data-end="3186"><br></p><p data-start="2983" data-end="3186">สุดท้ายนี้ ขออวยพรให้พี่ ๆ ผู้เกษียณอายุราชการทั้ง 6 ท่าน มีสุขภาพแข็งแรง</p><p data-start="2983" data-end="3186">มีความสุขกับชีวิตหลังเกษียณ ได้ใช้เวลาอยู่กับครอบครัวและคนที่รักอย่างเต็มที่&nbsp;</p><p data-start="2983" data-end="3186">และมีแต่เรื่องราวดี ๆ เข้ามาในชีวิตในทุก ๆ วันนะครับ</p><p data-start="2983" data-end="3186"><br></p><p data-start="2983" data-end="3186"><b>ใช้ตอนเชิญผู้บริหารมอบดอกไม้</b></p><p data-start="1545" data-end="1713" class="PDq2pG_selectionAnchorContainer"><strong data-start="1545" data-end="1554">ใหม่:</strong><br data-start="1554" data-end="1557">
+“ขอเชิญทุกท่านมอบดอกไม้ให้กับพี่ ๆ ผู้เกษียณนะคะ<br data-start="1605" data-end="1608">
+ดอกไม้แต่ละดอกอาจมีความหมายต่างกัน แต่สิ่งหนึ่งที่เหมือนกัน คือคำว่า <strong data-start="1677" data-end="1687">ขอบคุณ</strong> ที่พวกเราตั้งใจมอบให้ค่ะ”<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="1545" data-end="1713" class="PDq2pG_selectionAnchorContainer"><br></p><p data-start="2983" data-end="3186">
+</p><p data-start="1715" data-end="1879"><strong data-start="1715" data-end="1726">ศรัณยู:</strong><br data-start="1726" data-end="1729">
+“ขอบคุณสำหรับทุกเช้าที่พี่ ๆ ตื่นมาทำงาน<br data-start="1769" data-end="1772">
+ขอบคุณสำหรับทุกวันที่ทุ่มเทเพื่อประชาชน<br data-start="1811" data-end="1814">
+และขอบคุณสำหรับทุกสิ่งที่พี่ๆ ได้ส่งต่อให้กับพวกเรารุ่นหลังครับ”</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ดำเนินรายการโดย <strong>ภก.รังสรรค์ วงษ์บุญหนัก</strong> เภสัชกรเชี่ยวชาญ ซึ่งจะมาพูดคุยกับผู้เกษียณอายุราชการทั้ง 6 ท่านแบบใกล้ชิดครับ ขอเรียนเชิญขึ้นเวทีครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="3188" data-end="3281">แม้วันนี้จะเป็นวันสิ้นสุดของการทำงานในหน้าที่ราชการ แต่ไม่ได้หมายความว่าเราจะต้องจากกันนะครับ</p><p data-start="3188" data-end="3281"><br></p><p data-start="3283" data-end="3346"><strong data-start="3283" data-end="3346">ยังเป็นพี่ เป็นน้อง และเป็นเครือข่ายของเรากันเหมือนเดิมครับ</strong></p></div></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ระหว่างที่พี่ ๆ พูดคุยกันบนเวที ถ้าท่านใดอยากส่งคำถามหรือส่งกำลังใจให้พี่ ๆ ผู้เกษียณสามารถยกมือหรือส่งเสียงมาได้เลยนะคะ วันนี้เราเป็นกันเองค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="3348" data-end="3459" class="PDq2pG_selectionAnchorContainer">ใช่ค่ะ จากวันนี้ไปอาจจะไม่ต้องตื่นเช้ามาเข้าประชุม ไม่ต้องรีบส่งงาน ไม่ต้องวิ่งตามตัวชี้วัดแล้วนะคะ แต่ถ้าพวกเราคิดถึงกันเมื่อไหร่ ก็ยังกลับมาเจอกันได้เสมอค่ะ</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">แอบกระซิบว่าใครมีมุกฮา ๆ เก็บไว้เล่าตอนนี้เลยนะครับ เดี๋ยวจะไม่มีโอกาสแล้ว!</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">คืนนี้ต้องขอบพระคุณทุกท่านอีกครั้งครับ</div></div>
 
     <div class="direction">⏸️ (ผู้เกษียณ 6 ท่านนั่งพูดคุยกับผู้ดำเนินรายการแบบทอล์กโชว์ แลกเปลี่ยนเรื่องราวและความประทับใจในการทำงาน)</div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> จัดเก้าอี้วงสนทนาสไตล์ทอล์กโชว์บนเวที · เตรียมไมโครโฟนไร้สายสำหรับผู้ดำเนินรายการและผู้เกษียณ · เปิดเพลงเบา ๆ คลอระหว่างการพูดคุย</div>
+    <div class="cue-box editable"><p data-start="645" data-end="712" class="PDq2pG_selectionAnchorContainer"><strong data-start="645" data-end="654">กลอนเพิ่มเติม<br>ใหม่:</strong><br data-start="654" data-end="657">
+ขออนุญาตฝากบทกลอนสั้น ๆ ให้กับพี่ ๆ ผู้เกษียณของเรานะคะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<blockquote data-start="714" data-end="843">
+<p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b><br></b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>บทกลอนขอบคุณและอวยพร</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b><br></b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>สิบปีผ่าน กาลเวลา พาส่งเสริม</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>เกียรติประเดิม เพิ่มคุณค่า สง่าศรี</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>ครบกำหนด เกษียณอายุ สุขเปรมปรีดิ์</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>ขอสิ่งดี ทวีผล ดลสุข</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b><br></b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>ถึงเวลา พักผ่อน หย่อนกายา</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>แบกภาระ เพื่อประชา มาลุล่วง</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>ความเหนื่อยยาก พากเพียร สิ้นทั้งปวง</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>คุณความดี ประทับทรวง มิรู้ลืม</b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b><br></b></font></span></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>"มุทิตา จิตน้อม พร้อมใจส่</b></font></span><b style="color: rgb(42, 90, 74);">ง</b></p><p data-start="716" data-end="843"><b style="color: rgb(42, 90, 74);">ความซื่อตรง&nbsp;</b><b style="color: rgb(42, 90, 74);">ดำรงไว้ ให้ศึกษา</b></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>แม้เกษียณ&nbsp;</b></font></span><b style="color: rgb(42, 90, 74);">เปลี่ยนวิถี ที่ผ่านมา</b></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b>เกียรติยศ ยิ่ง</b></font></span><b style="color: rgb(42, 90, 74);">ศรัทธา</b><b style="color: rgb(42, 90, 74);">&nbsp;ยั่งยืนนาน"</b></p><p data-start="716" data-end="843"><span data-start="716" data-end="743"><font color="#2a5a4a"><b><br></b></font></span></p><p data-start="716" data-end="843"><b><span data-start="716" data-end="743">"วันเวลา ผันผ่าน ไม่หวนกลับ</span><br data-start="743" data-end="746">ความดีงามกลับ ยังประทับ มิเลือนหาย<br data-start="778" data-end="781">
+แม้วันนี้ ถึงเวลา พักร่างกาย<br data-start="810" data-end="813">
+แต่สายใย ผูกพันกัน นิรันดร"</b></p><p data-start="716" data-end="843"><b><br></b></p><p data-start="716" data-end="843"><b>ขอคุณพระ ประทานพร ประสิทธิ์โชค<br jsaction="" jscontroller="Gy8rfb#B4oRN" data-sfc-root="ep" jsuid="MHoHz_16" data-sfc-pl="|||[]" data-complete="true" data-copy-service-computed-style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; font-weight: 400; margin: 0px; text-decoration: none; border-bottom: 0px rgb(10, 10, 10);" style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; border-bottom: 0px rgb(10, 10, 10);">นิราศโศก ไร้โรคภัย สโมสร<br jsaction="" jscontroller="Gy8rfb#B4oRN" data-sfc-root="ep" jsuid="MHoHz_17" data-sfc-pl="|||[]" data-complete="true" data-copy-service-computed-style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; font-weight: 400; margin: 0px; text-decoration: none; border-bottom: 0px rgb(10, 10, 10);" style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; border-bottom: 0px rgb(10, 10, 10);">ใช้ชีวิต สุขสำราญ&nbsp;สถาพร<br jsaction="" jscontroller="Gy8rfb#B4oRN" data-sfc-root="ep" jsuid="MHoHz_18" data-sfc-pl="|||[]" data-complete="true" data-copy-service-computed-style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; font-weight: 400; margin: 0px; text-decoration: none; border-bottom: 0px rgb(10, 10, 10);" style="font-family: &quot;Google Sans&quot;, Arial, sans-serif; font-size: 16px; border-bottom: 0px rgb(10, 10, 10);">เป็นมิ่งขวัญ เภสัชกร ไปตราบนาน"</b></p><p data-start="716" data-end="843"><b>จากใจน้องๆ เภสัชกรและเครือข่ายคุ้มครองผู้บริโภค</b></p><b>ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลางทุกท่านนะครับ</b><p data-start="716" data-end="843"><b><br></b></p>
+</blockquote>
+<p data-start="845" data-end="1004" class=""><strong data-start="845" data-end="856">ศรัณยู:</strong><br data-start="856" data-end="859">
+“ขอให้ภาพถ่ายในค่ำคืนนี้ เป็นอีกหนึ่งภาพที่เมื่อพี่ ๆ เปิดกลับมาดูในวันข้างหน้า จะยังจำได้ว่า ครั้งหนึ่งเราเคยมีค่ำคืนที่อบอุ่นแบบนี้ร่วมกันครับ”</p><p data-start="1066" data-end="1247" class="PDq2pG_selectionAnchorContainer" style="color: rgb(107, 78, 16); font-size: 13px;"><strong data-start="1066" data-end="1077" style="color: rgb(162, 118, 15);"><br></strong></p><p data-start="1066" data-end="1247" class="PDq2pG_selectionAnchorContainer" style="color: rgb(107, 78, 16); font-size: 13px;"><strong data-start="1066" data-end="1077" style="color: rgb(162, 118, 15);">ศรัณยู:</strong><br data-start="1077" data-end="1080">“คืนนี้เราไม่ได้มาถ่ายรูปเพื่อเก็บไว้แค่เป็นภาพครับ แต่เราอยากเก็บช่วงเวลานี้ไว้เป็นความทรงจำว่า ครั้งหนึ่งพวกเราเคยได้ทำงาน เคยได้หัวเราะ และเคยได้เดินทางร่วมกันครับ”<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="1249" data-end="1371" style="color: rgb(107, 78, 16); font-size: 13px;"><strong data-start="1249" data-end="1258" style="color: rgb(162, 118, 15);">ใหม่:</strong><br data-start="1258" data-end="1261">“เพราะบางคนอาจไม่ได้อยู่ในห้องทำงานเดียวกันตลอดไป แต่ความผูกพันของพวกเรา ไม่ได้สิ้นสุดลงพร้อมกับวันเกษียณนะคะ”</p><p data-start="1373" data-end="1490" style="color: rgb(107, 78, 16); font-size: 13px;"><strong data-start="1373" data-end="1384" style="color: rgb(162, 118, 15);">ศรัณยู:</strong><br data-start="1384" data-end="1387">“จากเพื่อนร่วมงาน...กลายเป็นพี่น้อง และจากวันนี้ไป ไม่ว่าจะอยู่ที่ไหน เราก็ยังเป็นครอบครัวเดียวกันครับ”</p></div>
 
-    <div class="backup-box editable">💬 <strong>Backup หากบทสนทนาเงียบหรือต้องกระตุ้นบรรยากาศ:</strong> โยนคำถามสนุก ๆ เช่น "ความทรงจำที่ประทับใจที่สุดในการทำงานคืออะไรคะ/ครับ" หรือ "ถ้าย้อนกลับไปเป็นเภสัชกรจบใหม่อีกครั้ง อยากบอกอะไรกับตัวเองคะ/ครับ" หรือชวนผู้ร่วมงานโหวตว่าใครมีมุกฮาที่สุด หรือชวนแต่ละโต๊ะร้องเพลง</div>
+    <div class="backup-box editable"><p data-start="2128" data-end="2140" class="PDq2pG_selectionAnchorContainer">สำหรับช่วงถ่ายภาพหมู่ <strong data-start="1930" data-end="1943">(ผมแนะนำ)</strong></p><p data-start="2128" data-end="2140" class="PDq2pG_selectionAnchorContainer"><strong data-start="2142" data-end="2151">ใหม่:</strong></p><p data-start="2142" data-end="2216" class="">
+“ขอให้ภาพนี้เป็นภาพแห่งความรักและความผูกพันของพวกเราทุกคนนะคะ”</p><p data-start="2142" data-end="2216" class="">“งานอาจสิ้นสุดลงในวันนี้ แต่ความดี ความรัก และความผูกพัน ไม่ได้สิ้นสุดลงพร้อมกับวันเกษียณนะคะ”</p><p data-start="2142" data-end="2216" class=""><br></p><p data-start="2142" data-end="2216" class=""><span data-start="2374" data-end="2404"><b>ศรัณยู:</b><br>เกษียณมิใช่วันแห่งการจากลา&nbsp;</span><span data-start="2409" data-end="2439">แต่คือวันเวลาของการพักผ่อน</span><br data-start="2439" data-end="2442">
+<span data-start="2444" data-end="2485">สิ่งที่สร้างตลอดเส้นทางของชีวิตราชการ&nbsp;</span><span data-start="2490" data-end="2531">จะยังคงอยู่ในความทรงจำของพวกเราตลอดไป</span></p></div>
 
-    <div class="line"><div class="speaker-tag all">ศรัณยู & ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);">ขอบคุณพี่ ๆ ผู้เกษียณทุกท่านที่มาแบ่งปันเรื่องราวดี ๆ ในค่ำคืนนี้ค่ะ/ครับ ขอเสียงปรบมือดัง ๆ อีกครั้ง!</div></div>
+    <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3);"><p data-start="3575" data-end="3662" class="PDq2pG_selectionAnchorContainer">แล้วพบกันใหม่ในภาคเช้าของวันพรุ่งนี้นะคะ/ครับ<br data-start="3641" data-end="3644">สำหรับค่ำคืนนี้...</p>
+<p data-start="3664" data-end="3691" data-is-only-node=""><span data-start="3664" data-end="3688">ราตรีสวัสดิ์ค่ะ/ครับ</span></p></div></div>
 
     <div class="section-divider"><span>22.00 น. · ปิดพิธี</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">เรียนท่านรองนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ ผู้บริหาร ผู้เกษียณอายุราชการ และแขกผู้มีเกียรติทุกท่านค่ะ สำหรับค่ำคืนแห่งความประทับใจของเราได้ดำเนินมาอย่างครบถ้วนแล้วค่ะ ในนามคณะผู้จัดงาน ต้องขอกราบขอบพระคุณผู้เกษียณอายุราชการทุกท่าน ที่ได้ทุ่มเทเสียสละตลอดเส้นทางการรับราชการที่ผ่านมาค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="284" data-end="418" class="PDq2pG_selectionAnchorContainer"><strong data-start="284" data-end="293">(เพิ่มเติม)<br><br></strong></p><p data-start="284" data-end="418" class="PDq2pG_selectionAnchorContainer"><strong data-start="284" data-end="293">ใหม่:</strong><br data-start="293" data-end="296">
+“ดอกไม้หนึ่งดอก อาจแทนคำขอบคุณได้ไม่หมด<br data-start="335" data-end="338">
+แต่ทุกดอกไม้ในค่ำคืนนี้ คือความรักและความผูกพันที่พวกเรามีให้พี่ ๆ ผู้เกษียณค่ะ”<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="420" data-end="594"><strong data-start="420" data-end="431"><br></strong></p><p data-start="420" data-end="594"><strong data-start="420" data-end="431">ศรัณยู:</strong><br data-start="431" data-end="434">
+“จากวันแรกที่ก้าวเข้ามารับราชการ จนถึงวันนี้ที่เดินทางมาถึงวันเกษียณ<br data-start="502" data-end="505">
+สิ่งที่พี่ ๆ ทิ้งไว้ ไม่ใช่เพียงผลงาน แต่คือความทรงจำดี ๆ และแบบอย่างที่พวกเราจะจดจำครับ”</p></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอขอบพระคุณผู้บริหาร แขกผู้มีเกียรติ และผู้เข้าร่วมงานทุกท่าน ที่ได้ร่วมกันสร้างค่ำคืนนี้ให้เต็มไปด้วยความสุขและความประทับใจครับ ขอให้พี่ ๆ ผู้เกษียณมีสุขภาพแข็งแรง มีความสุขในทุกวันหลังเกษียณอายุราชการนะครับ 🙏</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><br></div></div>
 
-    <div class="line"><div class="speaker-tag all">ศรัณยู & ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3); font-size:16px;"><strong>แล้วพบกันใหม่ในภาคเช้าของวันพรุ่งนี้ค่ะ/ครับ สำหรับวันนี้ราตรีสวัสดิ์ค่ะ/ครับ 🌙</strong></div></div>
+    <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3); font-size:16px;"><strong>แล้วพบกันใหม่ในภาคเช้าของวันพรุ่งนี้ค่ะ/ครับ สำหรับวันนี้ราตรีสวัสดิ์ค่ะ/ครับ 🌙</strong></div></div>
   </div><!-- /seg3 -->
 
   <!-- ============================================ -->
@@ -465,55 +925,98 @@
 
     <div class="note-box">🎙️ <strong>โทนการพูด:</strong> กลับสู่โทนเป็นทางการ สุภาพ กระชับ เช่นเดียวกับภาคเช้าของวันแรก</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">สวัสดีค่ะทุกท่าน หวังว่าเมื่อคืนนี้ทุกท่านจะได้พักผ่อนกันอย่างเต็มที่นะคะ ขอต้อนรับเข้าสู่การประชุมวันที่ 2 ค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><b>ตอนที่ 3 · ภาคประชุมวิชาการ</b><p data-start="441" data-end="514" class="PDq2pG_selectionAnchorContainer">สวัสดีค่ะท่านผู้บริหาร วิทยากร และผู้เข้าร่วมประชุมทุกท่านค่ะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<div>ขอต้อนรับทุกท่านเข้าสู่การประชุมในวันที่ 2 ค่ะ</div></div></div>
 
     <div class="section-divider"><span>09.00 – 10.30 น. · บรรยาย: การตรวจสอบการโฆษณาที่เข้าข่ายฝ่าฝืนกฎหมายของสถานพยาบาล</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ลำดับแรกของวันนี้ ขอเรียนเชิญเข้าสู่การบรรยายในหัวข้อ <strong>"การตรวจสอบการโฆษณาที่เข้าข่ายกระทำฝ่าฝืนเกี่ยวกับกฎหมายโฆษณาของสถานพยาบาล ตามพระราชบัญญัติสถานพยาบาล"</strong> ค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><div>สำหรับช่วงเช้าของวันนี้ ขอเรียนเชิญทุกท่านเข้าสู่การบรรยายในหัวข้อ&nbsp;</div><div><strong data-start="631" data-end="737">“การตรวจสอบการโฆษณาที่เข้าข่ายกระทำฝ่าฝืนเกี่ยวกับกฎหมายโฆษณา</strong></div><strong data-start="631" data-end="737">ของสถานพยาบาล ตามพระราชบัญญัติสถานพยาบาล”</strong> ค่ะ</div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">โดยได้รับเกียรติจาก <strong>คุณอโนชา ชุมวิริยะสุขกุล</strong> นิติกรชำนาญการ เป็นวิทยากรบรรยายในหัวข้อนี้ครับ ขอเรียนเชิญวิทยากรขึ้นบรรยายครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="743" data-end="895" class="PDq2pG_selectionAnchorContainer">สำหรับการบรรยายในหัวข้อนี้&nbsp;</p><p data-start="743" data-end="895" class="PDq2pG_selectionAnchorContainer">เราได้รับเกียรติจากวิทยากรผู้มีความรู้และประสบการณ์ด้านกฎหมายสาธารณสุข และการควบคุมการโฆษณาสถานพยาบาลโดยตรงครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="897" data-end="1111"><br></p><p data-start="897" data-end="1111">ท่านได้มีประสบการณ์ในการบรรยายให้ความรู้แก่ผู้ประกอบวิชาชีพและผู้ประกอบกิจการสถานพยาบาล ในประเด็นเกี่ยวกับกฎหมายและจริยธรรมกับการให้บริการคลินิกการพยาบาล รวมถึงการประชุมเชิงปฏิบัติการเกี่ยวกับการโฆษณาสถานพยาบาลครับ</p><p data-start="897" data-end="1111"><br></p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">สำหรับประวัติการศึกษาที่สำคัญของท่าน ได้แก่</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">- สาธารณสุขศาสตรบัณฑิต</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">- สาธารณสุขศาสตรมหาบัณฑิต สาขาวิชาวิทยาศาสตร์สุขภาพ&nbsp;</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">&nbsp; &nbsp;มหาวิทยาลัยสุโขทัยธรรมาธิราช พ.ศ. 2552</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">-&nbsp; หลักสูตรประกาศนียบัตรกฎหมายปกครองและวิธีพิจารณาคดีปกครอง รุ่นที่ 7&nbsp;</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">&nbsp; &nbsp;มหาวิทยาลัยสวนดุสิต พ.ศ. 2567</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">- หลักสูตรนักบริหารระดับสูง (ส.นบส.) รุ่นที่ 14</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">- หลักสูตรการพัฒนานักกฎหมายในระดับชำนาญการขึ้นไป รุ่นที่ 29&nbsp;</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">&nbsp; &nbsp;สำนักงานคณะกรรมการกฤษฎีกา พ.ศ. 2564</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">- ผ่านการอบรมในระบบข้าราชการผู้มีผลสัมฤทธิ์สูง (HiPPS) รุ่นที่ 16</p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer"><strong data-start="1569" data-end="1592"><br></strong></p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer"><strong data-start="1569" data-end="1592">ปัจจุบันดำรงตำแหน่ง</strong><br data-start="1592" data-end="1595">
+หัวหน้ากลุ่มการโฆษณาและพิจารณาเปรียบเทียบคดี กองกฎหมาย กรมสนับสนุนบริการสุขภาพครับ</p><p data-start="1679" data-end="1762" class="PDq2pG_selectionAnchorContainer"><br></p><p data-start="1679" data-end="1762" class="PDq2pG_selectionAnchorContainer">ขอเสียงปรบมือต้อนรับวิทยากรของเราในเช้าวันนี้</p><p data-start="1679" data-end="1762" class="PDq2pG_selectionAnchorContainer">
+<strong data-start="1714" data-end="1762">คุณอโนชา ชุมวิริยะสุขกุล นิติกรชำนาญการพิเศษ</strong></p><p data-start="1113" data-end="1156" class="PDq2pG_selectionAnchorContainer">
+
+</p><p data-start="1810" data-end="1825">ขอเรียนเชิญครับ</p></div></div>
 
     <div class="direction">⏸️ (บรรยาย 09.00 – 10.30 น.)</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ขอขอบพระคุณวิทยากรเป็นอย่างสูงค่ะ สำหรับความรู้ด้านกฎหมายที่จะเป็นประโยชน์ต่อการทำงานตรวจสอบและกำกับดูแลของทุกท่านค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="1854" data-end="1942" class="PDq2pG_selectionAnchorContainer">ขอขอบพระคุณ <strong data-start="1878" data-end="1926">คุณอโนชา ชุมวิริยะสุขกุล นิติกรชำนาญการพิเศษ</strong> เป็นอย่างสูงค่ะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1944" data-end="2083">สำหรับความรู้และคำแนะนำด้านกฎหมายเกี่ยวกับการตรวจสอบการโฆษณาของสถานพยาบาล ซึ่งเป็นประโยชน์อย่างยิ่งต่อการนำไปใช้ในการปฏิบัติงานของพวกเราค่ะ</p><p data-start="1944" data-end="2083"><br></p>
+ขอเสียงปรบมือให้กับวิทยากรอีกครั้งค่ะ</div></div>
 
     <div class="section-divider"><span>10.30 – 11.00 น. · ประชุมกลุ่มย่อยตามเขตสุขภาพ</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ต่อไปในเวลา 10.30–11.00 น. ขอเชิญทุกท่านแบ่งกลุ่มย่อยออกเป็น 3 กลุ่ม ตามเขตสุขภาพ ได้แก่ เขต 4 เขต 5 และเขต 6 ครับ เพื่อร่วมกันพิจารณาปัญหาด้านงานคุ้มครองผู้บริโภค คบส. ในพื้นที่ภาคกลาง โดยมีหัวหน้ากลุ่มงานคุ้มครองผู้บริโภคฯ ของแต่ละจังหวัดในเขต เป็นผู้นำกลุ่มย่อยตามที่เจ้าหน้าที่แจ้งครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><strong data-start="328" data-end="339">ศรัณยู:</strong><br data-start="339" data-end="342">
+ลำดับต่อไป ขอเรียนเชิญทุกท่านแบ่งกลุ่มย่อยตามเขตสุขภาพ เพื่อร่วมกันพิจารณาและแลกเปลี่ยนความคิดเห็นเกี่ยวกับ <strong data-start="450" data-end="496">ปัญหาด้านงานคุ้มครองผู้บริโภค คบส. ภาคกลาง</strong> ครับ</div></div>
 
-    <div class="cue-box editable">🔧 <strong>Cue เจ้าหน้าที่:</strong> จัดโต๊ะ/มุมห้องสำหรับแต่ละกลุ่มย่อยทั้ง 3 กลุ่ม · แจกกระดาษ/แบบฟอร์มสรุปประเด็นให้แต่ละกลุ่ม</div>
+    <div class="cue-box editable"><h3 data-section-id="1yd0ijj" data-start="1177" data-end="1199" class="PDq2pG_selectionAnchorContainer">Cue เจ้าหน้าที่<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></h3>
+<ul data-start="1200" data-end="1403">
+<li data-section-id="k1n8j7" data-start="1200" data-end="1245">
+จัดโต๊ะ/มุมห้อง สำหรับกลุ่มย่อยทั้ง 3 กลุ่ม
+</li>
+<li data-section-id="3z55dd" data-start="1246" data-end="1312">
+ติดป้ายชื่อ <strong data-start="1260" data-end="1312">เขตสุขภาพที่ 4 / เขตสุขภาพที่ 5 / เขตสุขภาพที่ 6</strong>
+</li>
+<li data-section-id="1jssunu" data-start="1313" data-end="1357">
+แจกกระดาษ/แบบฟอร์มสรุปประเด็นให้แต่ละกลุ่ม
+</li>
+<li data-section-id="1hz64km" data-start="1358" data-end="1403">
+เจ้าหน้าที่ประจำแต่ละกลุ่มคอยอำนวยความสะดวก</li></ul></div>
 
     <div class="direction">⏸️ (แบ่งกลุ่มย่อยตามเขตสุขภาพ ประชุมกลุ่ม 10.30–11.00 น.)</div>
 
     <div class="section-divider"><span>11.00 – 11.30 น. · นำเสนอผลการประชุมกลุ่มย่อย</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">ต่อไปขอเชิญตัวแทนแต่ละเขตนำเสนอผลการหารือค่ะ เริ่มจากเขตสุขภาพที่ 4 นำเสนอปัญหาสำคัญและผลการดำเนินงานในปีงบประมาณ 2569 ค่ะ ขอเรียนเชิญค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="503" data-end="561" class="PDq2pG_selectionAnchorContainer">โดยจะแบ่งออกเป็น 3 กลุ่มตามเขตสุขภาพ ดังนี้ค่ะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="563" data-end="681"><strong data-start="563" data-end="592">กลุ่มที่ 1 เขตสุขภาพที่ 4</strong> ได้แก่<br data-start="599" data-end="602">
+นนทบุรี ปทุมธานี พระนครศรีอยุธยา สระบุรี ลพบุรี สิงห์บุรี อ่างทอง และนครนายกค่ะ</p><p data-start="683" data-end="810"><strong data-start="683" data-end="712">กลุ่มที่ 2 เขตสุขภาพที่ 5</strong> ได้แก่<br data-start="719" data-end="722">
+ราชบุรี กาญจนบุรี สุพรรณบุรี นครปฐม สมุทรสาคร สมุทรสงคราม เพชรบุรี และประจวบคีรีขันธ์ค่ะ</p><p data-start="1460" data-end="1535" class="PDq2pG_selectionAnchorContainer">
+
+
+</p><p data-start="812" data-end="917">และ <strong data-start="816" data-end="845">กลุ่มที่ 3 เขตสุขภาพที่ 6</strong> ได้แก่<br data-start="852" data-end="855">
+ชลบุรี ระยอง จันทบุรี ตราด ฉะเชิงเทรา ปราจีนบุรี และสระแก้วค่ะ</p></div></div>
 
     <div class="direction">⏸️ (เขต 4 นำเสนอ)</div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอบคุณครับ ต่อไปขอเชิญเขตสุขภาพที่ 5 นำเสนอในลำดับต่อไปครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><p data-start="919" data-end="1049">ขอเรียนเชิญหัวหน้ากลุ่มงานคุ้มครองผู้บริโภคฯ ของแต่ละจังหวัด นำกลุ่มย่อยของท่านไปยังพื้นที่ที่จัดเตรียมไว้ได้เลยครับ</p><p data-start="919" data-end="1049"><br></p><p data-start="919" data-end="1049">ใช้เวลาร่วมกันประมาณ 30 นาทีครับ ขอให้แต่ละกลุ่มช่วยกันแลกเปลี่ยนความคิดเห็น และรวบรวมประเด็นสำคัญ เพื่อนำเสนอในช่วงต่อไปครับ</p><p data-start="1051" data-end="1175"><br></p><p data-start="1460" data-end="1535" class="PDq2pG_selectionAnchorContainer">ขณะนี้ได้เวลาสำหรับการนำเสนอผลจากการประชุมกลุ่มย่อยแล้วนะครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="1537" data-end="1648">ลำดับแรก ขอเรียนเชิญ <strong data-start="1558" data-end="1582">ผู้แทนเขตสุขภาพที่ 4</strong> นำเสนอปัญหาที่สำคัญของเขต&nbsp;</p><p data-start="1537" data-end="1648">และผลการดำเนินงานในปีงบประมาณ 2569 ครับ</p><p data-start="1537" data-end="1648">ผู้แทนนำเสนอ : .......................................จากหน่วยงาน...............</p>
+<p data-start="1650" data-end="1665">/ขอเรียนเชิญครับ<br></p><p data-start="1667" data-end="1693" class="PDq2pG_selectionAnchorContainer"><em data-start="1667" data-end="1693"><br></em></p><p data-start="1667" data-end="1693" class="PDq2pG_selectionAnchorContainer"><em data-start="1667" data-end="1693"><em data-start="1869" data-end="1895">⏸️ </em>เขตสุขภาพที่ 4 นำเสนอ</em><span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p><p data-start="1695" data-end="1737"><strong data-start="1695" data-end="1704"><br></strong></p><p data-start="1695" data-end="1737"><strong data-start="1695" data-end="1704">ศรัณยู:</strong><br data-start="1704" data-end="1707">
+ขอบคุณผู้แทนเขตสุขภาพที่ 4 ครับ</p><p data-start="1739" data-end="1851"><br></p><p data-start="1739" data-end="1851">ลำดับต่อไป ขอเรียนเชิญ <strong data-start="1762" data-end="1786">ผู้แทนเขตสุขภาพที่ 5</strong> นำเสนอปัญหาที่สำคัญของเขต และผลการดำเนินงานในปีงบประมาณ 2569 ครับ</p><p data-start="1739" data-end="1851">ผู้แทนนำเสนอ : .......................................จากหน่วยงาน...............</p><p data-start="1853" data-end="1867">/ขอเรียนเชิญครับ</p></div></div>
 
     <div class="direction">⏸️ (เขต 5 นำเสนอ)</div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">และปิดท้ายด้วยเขตสุขภาพที่ 6 นำเสนอเป็นลำดับสุดท้ายค่ะ ขอเรียนเชิญค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="1897" data-end="1942">ขอบคุณผู้แทนเขตสุขภาพที่ 5 ค่ะ</p><p data-start="1944" data-end="2062"><br></p><p data-start="1944" data-end="2062">และลำดับสุดท้าย ขอเรียนเชิญ <strong data-start="1972" data-end="1996">ผู้แทนเขตสุขภาพที่ 6</strong> นำเสนอปัญหาที่สำคัญของเขต และผลการดำเนินงานในปีงบประมาณ 2569 ค่ะ</p><p data-start="1944" data-end="2062">ผู้แทนนำเสนอ : .......................................จากหน่วยงาน...............</p><p data-start="2064" data-end="2079">/ขอเรียนเชิญค่ะ</p></div></div>
 
     <div class="direction">⏸️ (เขต 6 นำเสนอ)</div>
 
     <div class="section-divider"><span>11.30 – 12.00 น. · ซักถามและให้ข้อเสนอแนะเพิ่มเติม</span></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอบคุณตัวแทนทั้ง 3 เขตสุขภาพครับ ต่อไปขอเปิดโอกาสให้ทุกท่านซักถามและให้ข้อเสนอแนะเพิ่มเติมต่อผลการนำเสนอครับ เชิญได้เลยครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอบคุณผู้แทนเขตสุขภาพที่ 6 ครับ และขอขอบคุณตัวแทนทั้ง 3 เขตสุขภาพครับ&nbsp;<div>ต่อไปขอเปิดโอกาสให้ทุกท่านซักถามและให้ข้อเสนอแนะเพิ่มเติมต่อผลการนำเสนอครับ เชิญได้เลยครับ</div></div></div>
 
     <div class="direction">⏸️ (ช่วงซักถาม/ข้อเสนอแนะ)</div>
 
     <div class="section-divider"><span>12.00 น. · ปิดการประชุม</span></div>
 
-    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable">และแล้วเราก็เดินทางมาถึงช่วงสุดท้ายของการประชุมในครั้งนี้แล้วนะคะ ตลอด 2 วันที่ผ่านมา เราได้ร่วมกันแลกเปลี่ยนความรู้ ประสบการณ์ และสร้างเครือข่ายที่เข้มแข็งให้กับงานคุ้มครองผู้บริโภคด้านผลิตภัณฑ์สุขภาพในเขตสุขภาพกลุ่มจังหวัดภาคกลางค่ะ</div></div>
+    <div class="line"><div class="speaker-tag mc1-tag">ใหม่</div><div class="speech-bubble mc1-bubble editable"><p data-start="2213" data-end="2348" class="PDq2pG_selectionAnchorContainer">จากการนำเสนอของทั้ง 3 เขตสุขภาพ จะเห็นว่าแต่ละพื้นที่มีทั้งปัญหา ประสบการณ์ และแนวทางการดำเนินงานที่น่าสนใจแตกต่างกันไปนะคะ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="2350" data-end="2476"><br></p><p data-start="2350" data-end="2476">ลำดับต่อไป ขอเปิดโอกาสให้ทุกท่านได้ร่วมกันซักถาม แลกเปลี่ยนความคิดเห็น&nbsp;</p><p data-start="2350" data-end="2476">และให้ข้อเสนอแนะเพิ่มเติมต่อผลการนำเสนอของทั้ง 3 เขตค่ะ</p><div><br></div><div>หากท่านใดมีประเด็นหรือข้อเสนอแนะ&nbsp; สามารถยกมือเพื่อร่วมแลกเปลี่ยนได้เลยนะคะ</div><div><div>⏸️ ดำเนินการซักถามและแลกเปลี่ยนความคิดเห็น</div></div></div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ในนามคณะผู้จัดงาน ผมและพี่ใหม่ขอกราบขอบพระคุณท่านวิทยากรทุกท่าน ผู้ร่วมอภิปรายทุกท่าน ผู้บริหาร และผู้เข้าร่วมประชุมทุกท่าน ที่ให้ความร่วมมือเป็นอย่างดีตลอดทั้ง 2 วันครับ ขอปิดการประชุมเชิงปฏิบัติการโครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569 ณ บัดนี้ครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอขอบพระคุณทุกท่านสำหรับคำถาม ข้อคิดเห็น และข้อเสนอแนะครับ&nbsp;<div>เชื่อว่าประเด็นต่าง ๆ ที่ได้แลกเปลี่ยนกันในวันนี้ จะเป็นประโยชน์ต่อการนำกลับไปพัฒนางานในแต่ละพื้นที่ต่อไปครับ</div><div><strong data-start="2816" data-end="2827"><br></strong></div><div><strong data-start="2816" data-end="2827">ศรัณยู:</strong></div><p data-start="2816" data-end="2879" class="PDq2pG_selectionAnchorContainer">
+และตอนนี้ก็มาถึงช่วงสุดท้ายของการประชุมแล้วนะครับ<span aria-hidden="true" class="PDq2pG_selectionAnchor"></span></p>
+<p data-start="2881" data-end="3062">การประชุมเชิงปฏิบัติการ <strong data-start="2905" data-end="3024">โครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569</strong> ได้ดำเนินมาครบถ้วนตามกำหนดการแล้วครับ</p>
+<p data-start="3064" data-end="3222">ตลอดระยะเวลา 2 วันที่ผ่านมา พวกเราได้ทั้งรับฟังความรู้ แลกเปลี่ยนประสบการณ์ ร่วมกันอภิปราย และได้พูดคุยถึงปัญหาและแนวทางการทำงานของเครือข่ายในแต่ละพื้นที่ครับ</p>
+<p data-start="3224" data-end="3427"><strong data-start="3224" data-end="3233"><br></strong></p><p data-start="3224" data-end="3427"><strong data-start="3224" data-end="3233">ใหม่:</strong><br data-start="3233" data-end="3236">
+ในนามคณะผู้จัดงาน ดิฉันและคุณศรัณยู ขอกราบขอบพระคุณท่านวิทยากร ผู้ร่วมอภิปรายทุกท่าน ผู้บริหาร และผู้เข้าร่วมประชุมทุกท่าน ที่ให้เกียรติมาร่วมงาน และให้ความร่วมมือเป็นอย่างดีตลอดทั้ง 2 วันค่ะ</p>
+<p data-start="3429" data-end="3633">หวังเป็นอย่างยิ่งว่า ความรู้ ประสบการณ์ และมิตรภาพที่ทุกท่านได้รับจากการประชุมครั้งนี้ จะสามารถนำไปใช้ประโยชน์ในการทำงาน และช่วยให้เครือข่ายคุ้มครองผู้บริโภคด้านผลิตภัณฑ์สุขภาพของพวกเราเข้มแข็งยิ่งขึ้นค่ะ</p>
+<p data-start="3635" data-end="3822"><strong data-start="3635" data-end="3646"><br></strong></p><p data-start="3635" data-end="3822"><strong data-start="3635" data-end="3646">ศรัณยู:</strong><br data-start="3646" data-end="3649">
+และหากตลอดระยะเวลาการจัดงานทั้ง 2 วันที่ผ่านมา มีสิ่งหนึ่งสิ่งใดขาดตกบกพร่อง หรือไม่ได้รับความสะดวกประการใด ในนามคณะผู้จัดงาน กระผมและพี่ใหม่ ต้องขออภัยมา ณ โอกาสนี้ด้วยครับ</p>
+<div>ขอขอบพระคุณทุกท่านอีกครั้ง สำหรับความร่วมมือ รอยยิ้ม และมิตรภาพที่มอบให้กับพวกเราตลอดการประชุมครับ</div><div><br></div><div>และแล้วเราก็เดินทางมาถึงช่วงสุดท้ายของการประชุมในครั้งนี้แล้วนะคะ ตลอด 2 วันที่ผ่านมา เราได้ร่วมกันแลกเปลี่ยนความรู้ ประสบการณ์ และสร้างเครือข่ายที่เข้มแข็งให้กับงานคุ้มครองผู้บริโภคด้านผลิตภัณฑ์สุขภาพในเขตสุขภาพกลุ่มจังหวัดภาคกลางค่ะ<br><div><br></div><div>ในนามคณะผู้จัดงาน ผมและพี่ใหม่ขอกราบขอบพระคุณท่านวิทยากรทุกท่าน ผู้ร่วมอภิปรายทุกท่าน ผู้บริหาร และผู้เข้าร่วมประชุมทุกท่าน ที่ให้ความร่วมมือเป็นอย่างดีตลอดทั้ง 2 วันครับ ขอปิดการประชุมเชิงปฏิบัติการโครงการพัฒนาสมรรถนะเครือข่ายคุ้มครองผู้บริโภค ด้านผลิตภัณฑ์สุขภาพ เขตสุขภาพกลุ่มจังหวัดภาคกลาง ประจำปีงบประมาณ 2569 ณ บัดนี้ครับ</div></div></div></div>
 
-    <div class="line"><div class="speaker-tag all">ศรัณยู & ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3); font-size:16px;"><strong>ขอกราบขอบพระคุณทุกท่านอีกครั้งค่ะ/ครับ สวัสดีค่ะ/ครับ 🙏</strong></div></div>
+    <div class="line"><div class="speaker-tag all">ศรัณยู &amp; ใหม่</div><div class="speech-bubble editable" style="border-color:rgba(100,100,100,0.3); font-size:16px;">ขอกราบขอบพระคุณทุกท่านอีกครั้งค่ะ/ครับ<br data-start="3983" data-end="3986">
+สวัสดีค่ะ/ครับ</div></div>
 
-    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable">ขอเรียนเชิญทุกท่านรับประทานอาหารกลางวันร่วมกันก่อนเดินทางกลับโดยสวัสดิภาพครับ ขอบคุณครับ</div></div>
+    <div class="line"><div class="speaker-tag mc2-tag">ศรัณยู</div><div class="speech-bubble mc2-bubble editable"><div class="qMYqUG_convSearchResultHighlightRoot"><div class="" data-turn-id-container="request-6a7c5eed-c994-83ec-b24c-d688dfd0960a-19" data-is-intersecting="true"><section class="text-token-text-primary w-full focus:outline-none has-data-writing-block:pointer-events-none [&amp;:has([data-writing-block])&gt;*]:pointer-events-auto R6Vx5W_threadScrollVars scroll-mb-[calc(var(--scroll-root-safe-area-inset-bottom,0px)+var(--thread-response-height))] scroll-mt-[calc(var(--header-height)+min(200px,max(70px,20svh)))]" dir="auto" data-turn-id="request-6a7c5eed-c994-83ec-b24c-d688dfd0960a-19" data-turn-id-container="request-6a7c5eed-c994-83ec-b24c-d688dfd0960a-19" data-testid="conversation-turn-42" data-turn="assistant"><div class="text-base my-auto mx-auto pb-8 [--thread-content-margin:var(--thread-content-margin-xs,calc(var(--spacing)*4))] @w-sm/main:[--thread-content-margin:var(--thread-content-margin-sm,calc(var(--spacing)*6))] @w-lg/main:[--thread-content-margin:var(--thread-content-margin-lg,calc(var(--spacing)*16))] px-(--thread-content-margin)"><div data-conversation-screenshot-content="" class="[--thread-content-max-width:40rem] @w-lg/main:[--thread-content-max-width:48rem] mx-auto max-w-(--thread-content-max-width) flex-1 group/turn-messages focus-visible:outline-hidden relative flex w-full min-w-0 flex-col agent-turn"><div class="flex max-w-full flex-col gap-4 grow"><div data-message-author-role="assistant" data-message-id="74c652aa-3a46-4642-9af5-29b7a95ba201" dir="auto" data-message-model-slug="gpt-5-6-mini" class="min-h-8 text-message relative flex w-full flex-col items-end gap-2 text-start break-words whitespace-normal outline-none keyboard-focused:focus-ring [.text-message+&amp;]:mt-1" data-turn-start-message="true" tabindex="0"><div class="flex w-full flex-col gap-1 empty:hidden"><div class="markdown prose dark:prose-invert wrap-break-word w-full light markdown-new-styling"><p data-start="4002" data-end="4091" class="PDq2pG_selectionAnchorContainer">ขอเรียนเชิญทุกท่านรับประทานอาหารกลางวันร่วมกันก่อนเดินทางกลับโดยสวัสดิภาพนะครับ&nbsp;&nbsp;</p><p data-start="4002" data-end="4091" class="PDq2pG_selectionAnchorContainer"><br></p><p data-start="4002" data-end="4091" class="PDq2pG_selectionAnchorContainer">และหวังว่าจะได้พบกันใหม่ในโอกาสต่อไปครับ</p>
+<p data-start="4171" data-end="4213">สำหรับวันนี้ เราสองคนต้องขอลากันไปก่อนครับ</p>
+<p data-start="4215" data-end="4233" data-is-last-node="" data-is-only-node=""><strong data-start="4215" data-end="4233" data-is-last-node="">สวัสดีครับ/ค่ะ</strong></p></div></div></div></div></div></div></section></div></div></div></div>
 
     <div class="direction">🍽️ (รับประทานอาหารกลางวันร่วมกัน 12.00 – 13.00 น. — จบภารกิจ)</div>
   </div><!-- /seg4 -->
@@ -526,32 +1029,44 @@
 
     <h3 style="font-size:15px; margin-top:16px;">ผู้เกษียณอายุราชการ ประจำปี 2569 (6 ท่าน)</h3>
     <table>
-      <tr><th>ลำดับ</th><th>ชื่อ-สกุล</th><th>ตำแหน่ง</th><th>หน่วยงาน</th></tr>
-      <tr><td>1</td><td>ภก.ดร.สุชาติ จองประเสริฐ</td><td>-</td><td>สำนักงานคณะกรรมการอาหารและยา</td></tr>
-      <tr><td>2</td><td>ภญ.ดวงกมล นุตราวงศ์</td><td>เภสัชกรเชี่ยวชาญ</td><td>สสจ.สระบุรี</td></tr>
-      <tr><td>3</td><td>ภญ.เรณู เดชมา</td><td>เภสัชกรเชี่ยวชาญ</td><td>สสจ.สิงห์บุรี</td></tr>
-      <tr><td>4</td><td>ภญ.วรลักษณ์ อนันตกูล</td><td>เภสัชกรเชี่ยวชาญ</td><td>สสจ.ราชบุรี</td></tr>
-      <tr><td>5</td><td>ภก.ภาณุ ศรีวรรัตน์</td><td>เภสัชกรเชี่ยวชาญ</td><td>สสจ.จันทบุรี</td></tr>
-      <tr><td>6</td><td>ภญ.ปิยะวรรณ จันทรสวัสดิ์</td><td>เภสัชกรชำนาญการพิเศษ</td><td>รพ.ธัญบุรี จ.ปทุมธานี</td></tr>
-    </table>
+      <tbody><tr><th>ลำดับ</th><th>ชื่อ-สกุล</th><th>ตำแหน่ง</th><th>หน่วยงาน</th></tr>
+      <tr><td>1</td><td>ภก.ดร.สุชาติ จองประเสริฐ</td><td>ผู้ทรงคุณวุฒิด้านความปลอดภัยและประสิทธิผล 
+และอดีตผู้อำนวยการสำนักยา สำนักงานคณะกรรมการอาหารและยา (อย.)</td><td>สำนักงานคณะกรรมการอาหารและยา</td></tr>
+      <tr><td>2</td><td>ภญ.ดวงกมล นุตราวงศ์</td><td>เภสัชกรเชี่ยวชาญ</td><td>สำนักงานสาธารณสุขจังหวัดสระบุรี</td></tr>
+      <tr><td>3</td><td>ภญ.เรณู เดชมา</td><td>เภสัชกรเชี่ยวชาญ</td><td>สำนักงานสาธารณสุขจังหวัดสิงห์บุรี</td></tr>
+      <tr><td>4</td><td>ภญ.วรลักษณ์ อนันตกูล</td><td>เภสัชกรเชี่ยวชาญ</td><td>สำนักงานสาธารณสุขจังหวัดราชบุรี</td></tr>
+      <tr><td>5</td><td>ภก.ภาณุ ศรีวรรัตน์</td><td>เภสัชกรเชี่ยวชาญ</td><td>สำนักงานสาธารณสุขจังหวัดจันทบุรี</td></tr>
+      <tr><td>6</td><td>ภญ.ปิยะวรรณ จันทรสวัสดิ์</td><td>เภสัชกรชำนาญการพิเศษ</td><td>โรงพยาบาลธัญบุรี จ.ปทุมธานี</td></tr>
+    </tbody></table>
     <div class="small-note">หมายเหตุ: ภก.ประสาท ลิ่มดุลย์ ข้าราชการบำนาญ นั่งเป็น VIP ตั้งแต่ต้นงาน ไม่อยู่ในขบวนเปิดตัว</div>
 
     <h3>ผู้ร่วมอภิปราย/วิทยากร วันที่ 13 ส.ค. — ภาคเช้า (09.15 – 12.00 น.)</h3>
     <ul>
       <li>นางรุ่งดารา เนียมโภคะ เภสัชกรชำนาญการพิเศษ</li>
+	  <li>หัวหน้ากลุ่มเฝ้าระวังและบังคับใช้กฎหมาย กองควบคุมเครื่องสำอางและวัตถุอันตราย</li>
       <li>นางวรางคณา เทวราชสมบูรณ์ เภสัชกรชำนาญการพิเศษ</li>
-      <li>ผู้ดำเนินรายการ: นางสาวเยาวนาถ ลาภานันต์ เภสัชกรชำนาญการพิเศษ (สสจ.ระยอง)</li>
+      <li>กลุ่มเฝ้าระวังและบังคับใช้กฎหมาย กองควบคุมเครื่องสำอางและวัตถุอันตราย</li>
+      <li>สำนักงานคณะกรรมการอาหารและยา กระทรวงสาธารณสุข</li>
+      <li>ผู้ดำเนินรายการ: นางสาวเยาวนาถ ลาภานันต์ เภสัชกรชำนาญการพิเศษ</li>
+	  <li>สำนักงานสาธารณสุขจังหวัดระยอง</li>
     </ul>
 
     <h3>ภาคบ่าย (13.00 – 18.00 น.)</h3>
     <ul>
-      <li>นายจีระสันต์ มีรัตน์ธนวัต ผู้แทน สสจ.ชลบุรี</li>
-      <li>นายอภิชาติ ชัยวรรณ ผู้แทน ป.ป.ส.</li>
-      <li>พ.ต.อ.วีระพงษ์ คล้ายทอง ผู้กำกับการ บก.ปคบ.</li>
-      <li>นางสาวจริยา อัครวรัณธร ผู้แทนศูนย์วิทยาศาสตร์การแพทย์ที่ 6 ชลบุรี</li>
-      <li>นายชาติชาย ตั้งทรงสุวรรณ์ ผู้แทนสำนักอาหาร อย.</li>
-      <li>นายวีระศักดิ์ เหล่าตระกูล ผู้แทน สสจ.นครปฐม</li>
+      <li>นายจีระสันต์ มีรัตน์ธนวัต เภสัชกรชำนาญการพิเศษ</li>
+	  <li>หัวหน้ากลุ่มงานคุ้มครองผู้บริโภคและเภสัชสาธารณสุข (ผู้แทน สสจ.ชลบุรี)</li>
+      <li>นายอภิชาติ ชัยวรรณ นักวิเคราะห์นโยบายและแผนชำนาญการ</li>
+      <li>สำนักงานคณะกรรมการป้องกันและปราบปรามยาเสพติด(ป.ป.ส.)(ผู้แทน ปปส.)</li>
+      <li>พ.ต.อ.วีระพงษ์ คล้ายทอง ผู้กำกับการ 4 กองบังคับการปราบปรามการกระทำความผิดเกี่ยวกับการคุ้มครองผู้บริโภค</li>
+      <li>กองบัญชาการตำรวจสอบสวนกลาง (CIB)(ผู้กำกับการ บก.ปคบ.)</li>
+      <li>นางสาวจริยา อัครวรัณธร เภสัชกรชำนาญการ</li>
+      <li>กลุ่มคุ้มครองผู้บริโภคด้านสาธารณสุข(ผู้แทนศูนย์วิทยาศาสตร์การแพทย์ที่ 6 ชลบุรี)</li>
+      <li>นายชาติชาย ตั้งทรงสุวรรณ์ นักวิชาการอาหารและยาชำนาญการพิเศษ</li>
+      <li>กลุ่มคุ้มครองผู้บริโภคด้านสาธารณสุข(ผู้แทนสำนักอาหาร อย.)</li>	  
+      <li>นายวีระศักดิ์ เหล่าตระกูล เภสัชกรเชี่ยวชาญ (ด้านเภสัชสาธารณสุข)</li>
+      <li>รองนายแพทย์สาธาณสุขจังหวัดนครปฐม (ผู้แทน สสจ.นครปฐม)</li>
       <li>ผู้ดำเนินรายการ: นางสาวณัฐยาภรณ์ วงศ์บุญเกื้อกูล เภสัชกรชำนาญการพิเศษ</li>
+      <li>ผู้ช่วยนายแพทย์สาธารณสุขจังหวัดสมุทรปราการ สำนักงานสาธารณสุขจังหวัดสมุทรปราการ</li>
     </ul>
 
     <h3>วิทยากร วันที่ 14 ส.ค.</h3>
@@ -614,5 +1129,6 @@
   document.body.classList.add('toolbar-active');
 </script>
 
-</body>
-</html>
+
+
+</body></html>
